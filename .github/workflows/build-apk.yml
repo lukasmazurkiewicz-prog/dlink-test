@@ -1,3 +1,14 @@
+name: Sestavit Android APK
+
+on:
+push:
+branches: [ "main", "master" ]
+workflow_dispatch:
+
+jobs:
+build:
+runs-on: ubuntu-latest
+
 steps:
   - name: Stažení repozitáře
     uses: actions/checkout@v4
