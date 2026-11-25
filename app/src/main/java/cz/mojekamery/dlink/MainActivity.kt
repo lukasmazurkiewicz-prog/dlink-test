@@ -197,7 +197,7 @@ data class LoadCamerasResult(
 
 object MydlinkClient {
     const val DEFAULT_EU_SITE = "https://mp-eu-openapi.auto.mydlink.com"
-    const val MYDLINK_WEB_PORTAL_URL = "https://my.dlink.com/"
+    const val MYDLINK_WEB_PORTAL_URL = "https://portal.mydlink.com/"
 
     val api: MydlinkApi by lazy {
         val logging = HttpLoggingInterceptor().apply {
@@ -219,7 +219,13 @@ object MydlinkClient {
 
     fun normalizeSiteUrl(rawSite: String?): String {
         val cleaned = rawSite?.trim()?.removeSuffix("/")
-        if (cleaned.isNullOrEmpty() || cleaned.contains("my.dlink.com")) return DEFAULT_EU_SITE
+        if (cleaned.isNullOrEmpty() || cleaned.contains("portal.mydlink.com") || cleaned.contains("mydlink.com")) {
+            return if (cleaned != null && cleaned.contains("openapi.auto.mydlink.com")) {
+                if (cleaned.startsWith("http")) cleaned else "https://$cleaned"
+            } else {
+                DEFAULT_EU_SITE
+            }
+        }
         return if (cleaned.startsWith("http")) cleaned else "https://$cleaned"
     }
 
