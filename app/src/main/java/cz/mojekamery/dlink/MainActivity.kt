@@ -460,9 +460,9 @@ fun MojeKameryApp() {
 
     var accessToken by remember { mutableStateOf(prefs.getString("access_token", null)) }
     var apiSite by remember { mutableStateOf(prefs.getString("api_site", MydlinkClient.DEFAULT_EU_API_SITE)) }
-    var cameras by remember { mutableStateOf(defaultUserCameras()) }
+    var cameras by remember { mutableStateOf(loadSavedCameras(prefs)) }
     var gridMode by remember { mutableStateOf(GridMode.QUAD) }
-    var selectedSingleId by remember { mutableStateOf("dcs-6500lh-1") }
+    var selectedSingleId by remember { mutableStateOf(cameras.firstOrNull()?.id ?: "dcs-6500lh-1") }
     var keepAwake by remember { mutableStateOf(true) }
     var keepAliveCountdown by remember { mutableIntStateOf(45) }
 
@@ -472,6 +472,7 @@ fun MojeKameryApp() {
     var diagnosticLog by remember { mutableStateOf("Zatím neproběhlo žádné volání API.") }
     var showDiagnosticDialog by remember { mutableStateOf(false) }
     var isRefreshingStreams by remember { mutableStateOf(false) }
+    var streamRefreshNonce by remember { mutableIntStateOf(0) }
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -541,6 +542,7 @@ fun MojeKameryApp() {
                 LoginScreen(
                     onLoginSuccess = { token, siteUrl, loadedCameras, diag ->
                         val cleanSite = MydlinkClient.normalizeSiteUrl(siteUrl)
+                        saveCameras(prefs, loadedCameras)
                         prefs.edit()
                             .putString("access_token", token)
                             .putString("api_site", cleanSite)
@@ -562,19 +564,22 @@ fun MojeKameryApp() {
                     keepAwake = keepAwake,
                     keepAliveSeconds = keepAliveCountdown,
                     isRefreshing = isRefreshingStreams,
+                    streamRefreshNonce = streamRefreshNonce,
                     onGridModeChange = { gridMode = it },
                     onSelectSingleCamera = { selectedSingleId = it },
                     onRefreshStreams = {
                         val token = accessToken ?: return@DashboardScreen
                         scope.launch {
                             isRefreshingStreams = true
+                            streamRefreshNonce += 1
                             val res = MydlinkClient.loadCamerasWithToken(token, apiSite)
                             if (!res.usedFallback && res.cameras.isNotEmpty()) {
                                 cameras = res.cameras
+                                saveCameras(prefs, res.cameras)
                             }
                             diagnosticLog = res.diagnosticLog
                             isRefreshingStreams = false
-                            snackbarHostState.showSnackbar("Streamy obnoveny")
+                            snackbarHostState.showSnackbar("Přehrávače streamů obnoveny")
                         }
                     },
                     onOpenDiagnostics = { showDiagnosticDialog = true },
@@ -620,7 +625,7 @@ fun MojeKameryApp() {
                     onLogout = {
                         CookieManager.getInstance().removeAllCookies(null)
                         CookieManager.getInstance().flush()
-                        prefs.edit().remove("access_token").remove("api_site").apply()
+                        prefs.edit().remove("access_token").remove("api_site").remove("saved_cameras_json").apply()
                         accessToken = null
                     }
                 )
@@ -710,6 +715,39 @@ fun MojeKameryApp() {
                 )
             }
         }
+    }
+}
+
+private fun saveCameras(prefs: android.content.SharedPreferences, list: List<CameraUiState>) {
+    val arr = JSONArray()
+    list.forEach { cam ->
+        arr.put(JSONObject().apply {
+            put("id", cam.id)
+            put("name", cam.name)
+            put("model", cam.model)
+        })
+    }
+    prefs.edit().putString("saved_cameras_json", arr.toString()).apply()
+}
+
+private fun loadSavedCameras(prefs: android.content.SharedPreferences): List<CameraUiState> {
+    val raw = prefs.getString("saved_cameras_json", null) ?: return defaultUserCameras()
+    return try {
+        val arr = JSONArray(raw)
+        val out = mutableListOf<CameraUiState>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            out.add(
+                CameraUiState(
+                    id = obj.optString("id", "cam_$i"),
+                    name = obj.optString("name", "Kamera ${i + 1}"),
+                    model = obj.optString("model", "DCS-6500LH")
+                )
+            )
+        }
+        if (out.isNotEmpty()) out else defaultUserCameras()
+    } catch (_: Exception) {
+        defaultUserCameras()
     }
 }
 
@@ -1010,11 +1048,6 @@ fun MydlinkWebOAuthDialog(
                                                     if (data && data.access_token && data.refresh_token) {
                                                         window.__lastUserToken = data.access_token;
                                                         window.__lastApiSite = data.api_site || srcUrl;
-                                                        AndroidOAuthBridge.onSessionCaptured(
-                                                            data.access_token,
-                                                            window.__lastApiSite,
-                                                            window.__lastDeviceJson
-                                                        );
                                                     }
                                                 } catch(e) {}
                                             }
@@ -1044,28 +1077,43 @@ fun MydlinkWebOAuthDialog(
                                                 if (allText.indexOf('Watch Live') === -1 && allText.indexOf('Click to watch') === -1) {
                                                     return null;
                                                 }
-                                                var blocks = document.querySelectorAll('div, section, article, li');
-                                                for (var i = 0; i < blocks.length; i++) {
-                                                    var el = blocks[i];
-                                                    var txt = (el.innerText || '').trim();
-                                                    if (txt.indexOf('Watch Live') !== -1 && txt.length < 220) {
-                                                        var lines = txt.split('\n').map(function(l) { return l.trim(); }).filter(function(l) {
-                                                            return l.length > 0 &&
-                                                                l.indexOf('Watch Live') === -1 &&
-                                                                l.indexOf('Click to watch') === -1 &&
-                                                                !(/^\d{4}\/\d{2}\/\d{2}/.test(l));
-                                                        });
-                                                        var camName = lines.length > 0 ? lines[0] : '';
-                                                        var modelMatch = txt.match(/DCS-[A-Z0-9]+/i);
-                                                        var modelName = modelMatch ? modelMatch[0].toUpperCase() : 'DCS-6500LH';
-                                                        if (camName && camName.length < 40 && !seen[camName]) {
-                                                            seen[camName] = true;
-                                                            found.push({
-                                                                mydlink_id: 'dom_cam_' + found.length + '_' + camName,
-                                                                device_name: camName,
-                                                                model: modelName,
-                                                                online: true
+                                                var nodes = document.querySelectorAll('div, span, button, a');
+                                                for (var i = 0; i < nodes.length; i++) {
+                                                    var n = nodes[i];
+                                                    var ownTxt = (n.innerText || '').trim();
+                                                    if (ownTxt === 'Watch Live' || ownTxt === 'Click to watch live recording') {
+                                                        var card = n.parentElement;
+                                                        for (var up = 0; up < 5 && card && card.parentElement; up++) {
+                                                            var cTxt = (card.innerText || '').trim();
+                                                            var watchCount = (cTxt.match(/Watch Live/g) || []).length;
+                                                            if (watchCount === 1 && cTxt.length > 20 && cTxt.length < 400) {
+                                                                break;
+                                                            }
+                                                            if (watchCount > 1) {
+                                                                card = card.firstElementChild || card;
+                                                                break;
+                                                            }
+                                                            card = card.parentElement;
+                                                        }
+                                                        if (card) {
+                                                            var lines = (card.innerText || '').split('\n').map(function(l) { return l.trim(); }).filter(function(l) {
+                                                                return l.length > 0 &&
+                                                                    l.indexOf('Watch Live') === -1 &&
+                                                                    l.indexOf('Click to watch') === -1 &&
+                                                                    !(/^\d{4}\/\d{2}\/\d{2}/.test(l));
                                                             });
+                                                            var camName = lines.length > 0 ? lines[0] : '';
+                                                            var modelMatch = (card.innerText || '').match(/DCS-[A-Z0-9]+/i);
+                                                            var modelName = modelMatch ? modelMatch[0].toUpperCase() : 'DCS-6500LH';
+                                                            if (camName && camName.length < 45 && !seen[camName]) {
+                                                                seen[camName] = true;
+                                                                found.push({
+                                                                    mydlink_id: 'dom_cam_' + found.length + '_' + camName,
+                                                                    device_name: camName,
+                                                                    model: modelName,
+                                                                    online: true
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1177,6 +1225,7 @@ fun DashboardScreen(
     keepAwake: Boolean,
     keepAliveSeconds: Int,
     isRefreshing: Boolean,
+    streamRefreshNonce: Int,
     onGridModeChange: (GridMode) -> Unit,
     onSelectSingleCamera: (String) -> Unit,
     onRefreshStreams: () -> Unit,
@@ -1304,11 +1353,12 @@ fun DashboardScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(bottom = 12.dp)
         ) {
-            items(visibleCameras, key = { it.id }) { camera ->
+            items(visibleCameras, key = { "${it.id}_$streamRefreshNonce" }) { camera ->
                 val tileIndex = visibleCameras.indexOf(camera).coerceAtLeast(0)
                 CameraTileCard(
                     camera = camera,
                     tileIndex = tileIndex,
+                    refreshNonce = streamRefreshNonce,
                     onRefreshStream = onRefreshStreams,
                     onToggleMute = { onToggleMute(camera.id) },
                     onPtzMove = { dir -> onPtzMove(camera.id, dir) },
@@ -1326,6 +1376,7 @@ fun DashboardScreen(
 fun CameraTileCard(
     camera: CameraUiState,
     tileIndex: Int = 0,
+    refreshNonce: Int = 0,
     onRefreshStream: () -> Unit,
     onToggleMute: () -> Unit,
     onPtzMove: (String) -> Unit,
@@ -1365,7 +1416,12 @@ fun CameraTileCard(
                 .background(Color.Black)
                 .clickable { onOpenFullscreen() }
         ) {
-            CameraVideoSurface(camera = camera, tileIndex = tileIndex, onRefreshStream = onRefreshStream)
+            CameraVideoSurface(
+                camera = camera,
+                tileIndex = tileIndex,
+                refreshNonce = refreshNonce,
+                onRefreshStream = onRefreshStream
+            )
 
             Row(
                 modifier = Modifier
@@ -1504,18 +1560,15 @@ fun PtzDpadControl(onMove: (String) -> Unit, large: Boolean = false) {
 fun CameraVideoSurface(
     camera: CameraUiState,
     tileIndex: Int = 0,
+    refreshNonce: Int = 0,
     onRefreshStream: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("mydlink_prefs", Context.MODE_PRIVATE) }
     val token = remember { prefs.getString("access_token", null) }
-    var webVideoPlaying by remember(camera.id) { mutableStateOf(false) }
-
-    LaunchedEffect(camera.id, webVideoPlaying) {
-        if (!webVideoPlaying && camera.streamUrl == null && token != null && token != "demo_local_token") {
-            delay(9000L)
-            webVideoPlaying = true
-        }
+    var webVideoPlaying by remember(camera.id, refreshNonce) { mutableStateOf(false) }
+    var streamStatusText by remember(camera.id, refreshNonce) {
+        mutableStateOf("Načítám mydlink (${camera.model})...")
     }
 
     if (camera.privacyMode) {
@@ -1586,6 +1639,11 @@ fun CameraVideoSurface(
                             fun onVideoFramesReady() {
                                 post { webVideoPlaying = true }
                             }
+
+                            @JavascriptInterface
+                            fun onStatusUpdate(status: String) {
+                                post { streamStatusText = status }
+                            }
                         }, "AndroidStreamBridge")
 
                         webViewClient = object : WebViewClient() {
@@ -1597,29 +1655,68 @@ fun CameraVideoSurface(
                                         var targetName = $safeName;
                                         var fallbackIdx = $tileIndex;
                                         var clickedWatchLive = false;
-                                        var ticks = 0;
+                                        var clickAttempts = 0;
 
-                                        function findBestCard() {
-                                            var best = null;
-                                            var bestLen = 999999;
-                                            var allCards = [];
-                                            var blocks = document.querySelectorAll('div, section, article, li');
-                                            for (var i = 0; i < blocks.length; i++) {
-                                                var el = blocks[i];
-                                                var txt = (el.innerText || '');
-                                                var hasLiveTrigger = (txt.indexOf('Watch Live') !== -1 || txt.indexOf('Click to watch') !== -1 || el.querySelector('video, canvas'));
-                                                if (hasLiveTrigger && txt.length < 350) {
-                                                    allCards.push(el);
-                                                    if (txt.toLowerCase().indexOf(targetName.toLowerCase()) !== -1 && txt.length < bestLen) {
-                                                        best = el;
-                                                        bestLen = txt.length;
+                                        function triggerRealClick(el) {
+                                            if (!el) return;
+                                            try {
+                                                var rect = el.getBoundingClientRect();
+                                                var cx = rect.left + rect.width / 2;
+                                                var cy = rect.top + rect.height / 2;
+                                                var opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+                                                el.dispatchEvent(new PointerEvent('pointerdown', opts));
+                                                el.dispatchEvent(new MouseEvent('mousedown', opts));
+                                                el.dispatchEvent(new PointerEvent('pointerup', opts));
+                                                el.dispatchEvent(new MouseEvent('mouseup', opts));
+                                                el.dispatchEvent(new MouseEvent('click', opts));
+                                                if (typeof el.click === 'function') el.click();
+                                            } catch(e) {
+                                                try { el.click(); } catch(err) {}
+                                            }
+                                        }
+
+                                        function collectCameraCards() {
+                                            var cards = [];
+                                            var seen = new Set();
+                                            var nodes = document.querySelectorAll('div, span, button, a');
+                                            for (var i = 0; i < nodes.length; i++) {
+                                                var n = nodes[i];
+                                                var t = (n.innerText || '').trim();
+                                                if (t === 'Watch Live' || t === 'Click to watch live recording') {
+                                                    var card = n.parentElement;
+                                                    for (var up = 0; up < 6 && card && card.parentElement; up++) {
+                                                        var cTxt = (card.innerText || '');
+                                                        var matches = (cTxt.match(/Watch Live/g) || []).length;
+                                                        if (matches === 1 && cTxt.length > 15 && cTxt.length < 450) {
+                                                            break;
+                                                        }
+                                                        if (matches > 1) {
+                                                            card = card.firstElementChild || card;
+                                                            break;
+                                                        }
+                                                        card = card.parentElement;
+                                                    }
+                                                    if (card && !seen.has(card)) {
+                                                        seen.add(card);
+                                                        cards.push(card);
                                                     }
                                                 }
                                             }
-                                            if (!best && ticks > 3 && allCards.length > fallbackIdx) {
-                                                best = allCards[fallbackIdx];
+                                            return cards;
+                                        }
+
+                                        function findTargetCard(cards) {
+                                            var normTarget = targetName.toLowerCase().trim();
+                                            for (var i = 0; i < cards.length; i++) {
+                                                var cTxt = (cards[i].innerText || '').toLowerCase();
+                                                if (normTarget && cTxt.indexOf(normTarget) !== -1) {
+                                                    return cards[i];
+                                                }
                                             }
-                                            return best;
+                                            if (cards.length > fallbackIdx) {
+                                                return cards[fallbackIdx];
+                                            }
+                                            return cards.length > 0 ? cards[0] : null;
                                         }
 
                                         function pinElementFullscreen(el) {
@@ -1635,7 +1732,7 @@ fun CameraVideoSurface(
                                                 v.autoplay = true;
                                                 v.playsInline = true;
                                                 if (v.paused) { v.play().catch(function(){}); }
-                                                if (v.readyState >= 2 && v.videoWidth > 0) {
+                                                if (v.readyState >= 2 || v.videoWidth > 0) {
                                                     pinElementFullscreen(v);
                                                     return true;
                                                 }
@@ -1654,28 +1751,39 @@ fun CameraVideoSurface(
                                         }
 
                                         setInterval(function() {
-                                            ticks++;
                                             if (isolateVideoOrCanvas()) return;
-                                            var card = findBestCard();
-                                            if (card && !clickedWatchLive) {
-                                                try { card.scrollIntoView({block: 'center'}); } catch(e) {}
-                                                var btns = card.querySelectorAll('button, span, div, a, img');
-                                                for (var k = 0; k < btns.length; k++) {
-                                                    var bTxt = (btns[k].innerText || '').trim();
-                                                    if (bTxt === 'Watch Live' || bTxt.indexOf('Watch Live') !== -1 || bTxt.indexOf('Click to watch') !== -1) {
-                                                        btns[k].click();
-                                                        btns[k].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+
+                                            var cards = collectCameraCards();
+                                            if (cards.length === 0) {
+                                                AndroidStreamBridge.onStatusUpdate('Hledám kameru ' + targetName + '...');
+                                                return;
+                                            }
+
+                                            var card = findTargetCard(cards);
+                                            if (card && clickAttempts < 4) {
+                                                clickAttempts++;
+                                                try { card.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch(e) {}
+                                                AndroidStreamBridge.onStatusUpdate('Spouštím Watch Live (' + targetName + ')...');
+
+                                                var targets = card.querySelectorAll('button, span, div, img');
+                                                for (var k = 0; k < targets.length; k++) {
+                                                    var bTxt = (targets[k].innerText || '').trim();
+                                                    if (bTxt === 'Watch Live' || bTxt === 'Click to watch live recording') {
+                                                        triggerRealClick(targets[k]);
+                                                        if (targets[k].parentElement) triggerRealClick(targets[k].parentElement);
                                                         clickedWatchLive = true;
                                                         break;
                                                     }
                                                 }
                                                 if (!clickedWatchLive) {
-                                                    card.click();
-                                                    card.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                                    var img = card.querySelector('img');
+                                                    triggerRealClick(img || card);
                                                     clickedWatchLive = true;
                                                 }
+                                            } else if (clickedWatchLive) {
+                                                AndroidStreamBridge.onStatusUpdate('Navazuji P2P obraz (' + targetName + ')...');
                                             }
-                                        }, 850);
+                                        }, 900);
                                     })();
                                 """.trimIndent()
                                 view?.evaluateJavascript(playerHook, null)
@@ -1683,7 +1791,7 @@ fun CameraVideoSurface(
                         }
                         postDelayed({
                             loadUrl(MydlinkClient.MYDLINK_WEB_PORTAL_URL)
-                        }, (tileIndex * 450L))
+                        }, (tileIndex * 650L))
                     }
                 },
                 update = { webView ->
@@ -1713,10 +1821,12 @@ fun CameraVideoSurface(
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "Připojuji WebRTC (${camera.model})...",
+                            streamStatusText,
                             fontSize = 10.sp,
                             color = Color(0xFFD1D5DB),
-                            textAlign = TextAlign.Center
+                            textAlign = TextAlign.Center,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
                         )
                         Spacer(Modifier.height(6.dp))
                         OutlinedButton(
