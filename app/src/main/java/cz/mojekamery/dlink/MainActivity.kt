@@ -199,8 +199,7 @@ interface MydlinkApi {
 
 object MydlinkClient {
     const val DEFAULT_EU_SITE = "https://mp-eu-openapi.auto.mydlink.com"
-    const val OAUTH_AUTHORIZE_WEB_URL =
-        "https://api.auto.mydlink.com/oauth/authorize?client_id=mydlinkliteandroid&redirect_uri=https://www.mydlink.com/callback&response_type=token"
+    const val MYDLINK_PORTAL_URL = "https://portal.mydlink.com/"
 
     val api: MydlinkApi by lazy {
         val logging = HttpLoggingInterceptor().apply {
@@ -835,14 +834,16 @@ fun MydlinkWebOAuthDialog(
     onDismiss: () -> Unit,
     onTokenCaptured: (String, String?) -> Unit
 ) {
+    var captured by remember { mutableStateOf(false) }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("mydlink OAuth2 přihlášení", fontSize = 16.sp) },
+        title = { Text("Přihlášení přes mydlink portál", fontSize = 16.sp) },
         text = {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(430.dp)
+                    .height(450.dp)
                     .clip(RoundedCornerShape(12.dp))
             ) {
                 AndroidView(
@@ -850,26 +851,68 @@ fun MydlinkWebOAuthDialog(
                         WebView(ctx).apply {
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
+                            settings.databaseEnabled = true
                             webViewClient = object : WebViewClient() {
-                                override fun shouldOverrideUrlLoading(
+                                override fun shouldInterceptRequest(
                                     view: WebView?,
                                     request: WebResourceRequest?
-                                ): Boolean {
-                                    val urlStr = request?.url?.toString() ?: return false
-                                    if (urlStr.contains("access_token=")) {
-                                        val normalized = urlStr.replace("#", "?")
-                                        val uri = Uri.parse(normalized)
-                                        val token = uri.getQueryParameter("access_token")
-                                        val site = uri.getQueryParameter("api_site")
-                                        if (!token.isNullOrBlank()) {
-                                            onTokenCaptured(token, site)
-                                            return true
+                                ): android.webkit.WebResourceResponse? {
+                                    val urlStr = request?.url?.toString().orEmpty()
+                                    val authHeader = request?.requestHeaders?.get("Authorization")
+                                        ?: request?.requestHeaders?.get("authorization")
+
+                                    if (!captured && !authHeader.isNullOrBlank() && authHeader.startsWith("Bearer ", ignoreCase = true)) {
+                                        val token = authHeader.substringAfter(" ").trim()
+                                        if (token.length > 15) {
+                                            captured = true
+                                            val detectedSite = if (urlStr.contains("auto.mydlink.com")) {
+                                                "https://" + Uri.parse(urlStr).host
+                                            } else {
+                                                MydlinkClient.DEFAULT_EU_SITE
+                                            }
+                                            view?.post { onTokenCaptured(token, detectedSite) }
                                         }
                                     }
-                                    return false
+                                    return super.shouldInterceptRequest(view, request)
+                                }
+
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    if (captured) return
+                                    // Zkusíme přečíst access_token přímo z localStorage / sessionStorage portálu
+                                    val js = """
+                                        (function() {
+                                            try {
+                                                for (var i = 0; i < localStorage.length; i++) {
+                                                    var k = localStorage.key(i);
+                                                    var v = localStorage.getItem(k);
+                                                    if (v && v.indexOf('access_token') !== -1) return v;
+                                                    if (k && k.toLowerCase().indexOf('token') !== -1 && v && v.length > 20) return v;
+                                                }
+                                                for (var j = 0; j < sessionStorage.length; j++) {
+                                                    var sk = sessionStorage.key(j);
+                                                    var sv = sessionStorage.getItem(sk);
+                                                    if (sv && sv.indexOf('access_token') !== -1) return sv;
+                                                }
+                                            } catch(e) {}
+                                            return '';
+                                        })();
+                                    """.trimIndent()
+                                    view?.evaluateJavascript(js) { raw ->
+                                        if (captured || raw.isNullOrBlank() || raw == "\"\"") return@evaluateJavascript
+                                        val cleaned = raw.trim('"').replace("\\\"", "\"")
+                                        val tokenMatch = Regex("\"access_token\"\\s*:\\s*\"([^\"]+)\"").find(cleaned)
+                                        val siteMatch = Regex("\"api_site\"\\s*:\\s*\"([^\"]+)\"").find(cleaned)
+                                        val token = tokenMatch?.groupValues?.getOrNull(1)
+                                            ?: cleaned.takeIf { !it.contains("{") && it.length > 20 }
+                                        if (!token.isNullOrBlank()) {
+                                            captured = true
+                                            onTokenCaptured(token, siteMatch?.groupValues?.getOrNull(1))
+                                        }
+                                    }
                                 }
                             }
-                            loadUrl(MydlinkClient.OAUTH_AUTHORIZE_WEB_URL)
+                            loadUrl(MydlinkClient.MYDLINK_PORTAL_URL)
                         }
                     },
                     modifier = Modifier.fillMaxSize()
