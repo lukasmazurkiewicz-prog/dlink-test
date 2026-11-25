@@ -1,6 +1,7 @@
 package cz.mojekamery.dlink
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,8 +9,12 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -67,6 +72,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.HttpException
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.*
@@ -81,7 +87,7 @@ data class AuthResponse(
     val access_token: String,
     val refresh_token: String?,
     val expires_in: Long?,
-    val api_site: String? // Regionální server vrácený při přihlášení (pro ČR/EU obvykle mp-eu-openapi.auto.mydlink.com)
+    val api_site: String?
 )
 
 data class DeviceListResponse(
@@ -139,14 +145,14 @@ data class BaseResponse(
 )
 
 interface MydlinkApi {
-    // Přihlášení jde vždy na globální OAuth server api.auto.mydlink.com
     @FormUrlEncoded
-    @POST("https://api.auto.mydlink.com/oauth/authorize2")
-    suspend fun login(
+    @POST
+    suspend fun loginAtUrl(
+        @Url loginUrl: String,
         @Field("client_id") clientId: String = "mydlinkuap",
         @Field("grant_type") grantType: String = "password",
         @Field("username") email: String,
-        @Field("password") passwordMd5: String
+        @Field("password") password: String
     ): AuthResponse
 
     @GET
@@ -193,6 +199,8 @@ interface MydlinkApi {
 
 object MydlinkClient {
     const val DEFAULT_EU_SITE = "https://mp-eu-openapi.auto.mydlink.com"
+    const val OAUTH_AUTHORIZE_WEB_URL =
+        "https://api.auto.mydlink.com/oauth/authorize?client_id=mydlinkliteandroid&redirect_uri=https://www.mydlink.com/callback&response_type=token"
 
     val api: MydlinkApi by lazy {
         val logging = HttpLoggingInterceptor().apply {
@@ -221,6 +229,27 @@ object MydlinkClient {
     fun md5(input: String): String {
         val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray())
         return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    suspend fun loadCamerasWithToken(token: String, siteUrl: String): List<CameraUiState> {
+        val devicesResp = api.getDevices("$siteUrl/me/device/list", "Bearer $token")
+        return devicesResp.data.orEmpty().map { dto ->
+            val stream = runCatching {
+                api.startStream(
+                    "$siteUrl/device/stream/start",
+                    "Bearer $token",
+                    StreamRequest(dto.mydlink_id, "sub")
+                )
+            }.getOrNull()
+            CameraUiState(
+                id = dto.mydlink_id,
+                name = dto.device_name,
+                model = dto.model,
+                isOnline = dto.online,
+                streamUrl = stream?.url,
+                streamId = stream?.stream_id
+            )
+        }
     }
 }
 
@@ -593,7 +622,7 @@ fun MojeKameryApp() {
 }
 
 // ============================================================================
-// 5. PŘIHLAŠOVACÍ OBRAZOVKA
+// 5. PŘIHLAŠOVACÍ OBRAZOVKA + OAUTH2 WEBVIEW
 // ============================================================================
 
 @Composable
@@ -607,6 +636,25 @@ fun LoginScreen(
     var rememberToken by remember { mutableStateOf(true) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var showWebOAuth by remember { mutableStateOf(false) }
+
+    if (showWebOAuth) {
+        MydlinkWebOAuthDialog(
+            onDismiss = { showWebOAuth = false },
+            onTokenCaptured = { capturedToken, capturedSite ->
+                showWebOAuth = false
+                isLoading = true
+                scope.launch {
+                    val siteUrl = MydlinkClient.normalizeSiteUrl(capturedSite)
+                    val loaded = runCatching {
+                        MydlinkClient.loadCamerasWithToken(capturedToken, siteUrl)
+                    }.getOrDefault(defaultUserCameras())
+                    isLoading = false
+                    onLoginSuccess(capturedToken, siteUrl, loaded)
+                }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -698,7 +746,7 @@ fun LoginScreen(
             )
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(14.dp))
 
         Button(
             onClick = {
@@ -706,35 +754,41 @@ fun LoginScreen(
                 errorMessage = null
                 scope.launch {
                     try {
-                        val auth = MydlinkClient.api.login(
-                            email = email.trim(),
-                            passwordMd5 = MydlinkClient.md5(password)
+                        val endpoints = listOf(
+                            "https://api.auto.mydlink.com/oauth/token",
+                            "https://mp-eu-openapi.auto.mydlink.com/oauth/token",
+                            "https://api.auto.mydlink.com/oauth/authorize2"
                         )
-                        val siteUrl = MydlinkClient.normalizeSiteUrl(auth.api_site)
-                        val devicesResp = MydlinkClient.api.getDevices(
-                            "$siteUrl/me/device/list",
-                            "Bearer ${auth.access_token}"
-                        )
-                        val mapped = devicesResp.data.orEmpty().map { dto ->
-                            val stream = runCatching {
-                                MydlinkClient.api.startStream(
-                                    "$siteUrl/device/stream/start",
-                                    "Bearer ${auth.access_token}",
-                                    StreamRequest(dto.mydlink_id, "sub")
+                        var authResult: AuthResponse? = null
+                        var lastErr: Exception? = null
+
+                        for (ep in endpoints) {
+                            try {
+                                authResult = MydlinkClient.api.loginAtUrl(
+                                    loginUrl = ep,
+                                    email = email.trim(),
+                                    password = MydlinkClient.md5(password)
                                 )
-                            }.getOrNull()
-                            CameraUiState(
-                                id = dto.mydlink_id,
-                                name = dto.device_name,
-                                model = dto.model,
-                                isOnline = dto.online,
-                                streamUrl = stream?.url,
-                                streamId = stream?.stream_id
-                            )
+                                break
+                            } catch (ex: Exception) {
+                                lastErr = ex
+                            }
                         }
-                        onLoginSuccess(auth.access_token, siteUrl, mapped)
+
+                        if (authResult == null) {
+                            if (lastErr is HttpException && lastErr.code() == 404) {
+                                isLoading = false
+                                showWebOAuth = true
+                                return@launch
+                            }
+                            throw lastErr ?: IllegalStateException("Nepodařilo se získat token")
+                        }
+
+                        val siteUrl = MydlinkClient.normalizeSiteUrl(authResult.api_site)
+                        val mapped = MydlinkClient.loadCamerasWithToken(authResult.access_token, siteUrl)
+                        onLoginSuccess(authResult.access_token, siteUrl, mapped)
                     } catch (e: Exception) {
-                        errorMessage = "Chyba přihlášení k mydlink API: ${e.localizedMessage ?: "Zkontrolujte údaje"}"
+                        errorMessage = "Přímé API přihlášení vrátilo chybu (${e.localizedMessage}). Použijte webové OAuth2 přihlášení níže."
                     } finally {
                         isLoading = false
                     }
@@ -751,7 +805,19 @@ fun LoginScreen(
             }
         }
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(10.dp))
+
+        FilledTonalButton(
+            onClick = { showWebOAuth = true },
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Icon(Icons.Default.Language, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Přihlásit přes mydlink OAuth2 bránu")
+        }
+
+        Spacer(Modifier.height(10.dp))
 
         OutlinedButton(
             onClick = { onLoginSuccess("demo_local_token", MydlinkClient.DEFAULT_EU_SITE, defaultUserCameras()) },
@@ -761,6 +827,59 @@ fun LoginScreen(
             Text("Spustit v offline Demo režimu (4 kamery)")
         }
     }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun MydlinkWebOAuthDialog(
+    onDismiss: () -> Unit,
+    onTokenCaptured: (String, String?) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("mydlink OAuth2 přihlášení", fontSize = 16.sp) },
+        text = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(430.dp)
+                    .clip(RoundedCornerShape(12.dp))
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): Boolean {
+                                    val urlStr = request?.url?.toString() ?: return false
+                                    if (urlStr.contains("access_token=")) {
+                                        val normalized = urlStr.replace("#", "?")
+                                        val uri = Uri.parse(normalized)
+                                        val token = uri.getQueryParameter("access_token")
+                                        val site = uri.getQueryParameter("api_site")
+                                        if (!token.isNullOrBlank()) {
+                                            onTokenCaptured(token, site)
+                                            return true
+                                        }
+                                    }
+                                    return false
+                                }
+                            }
+                            loadUrl(MydlinkClient.OAUTH_AUTHORIZE_WEB_URL)
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Zrušit") }
+        }
+    )
 }
 
 // ============================================================================
