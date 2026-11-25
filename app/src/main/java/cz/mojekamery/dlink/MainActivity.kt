@@ -204,6 +204,14 @@ object MydlinkClient {
             level = HttpLoggingInterceptor.Level.BASIC
         }
         val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request().newBuilder()
+                    .header("Origin", "https://portal.mydlink.com")
+                    .header("Referer", "https://portal.mydlink.com/")
+                    .header("Accept", "application/json")
+                    .build()
+                chain.proceed(req)
+            }
             .addInterceptor(logging)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
@@ -239,7 +247,8 @@ object MydlinkClient {
         val candidateSites = listOf(
             siteUrl,
             "https://mp-eu-openapi.auto.mydlink.com",
-            "https://mp-openapi.auto.mydlink.com"
+            "https://mp-openapi.auto.mydlink.com",
+            "https://api.auto.mydlink.com"
         ).distinct()
 
         val candidatePaths = listOf(
@@ -1019,10 +1028,13 @@ fun MydlinkWebOAuthDialog(
                     factory = { ctx ->
                         WebView(ctx).apply {
                             CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
+                            settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = true
                             settings.userAgentString =
-                                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
                             addJavascriptInterface(object {
                                 @JavascriptInterface
@@ -1481,15 +1493,32 @@ fun CameraVideoSurface(
             modifier = Modifier.fillMaxSize()
         )
     } else if (showWebPlayer) {
-        // Vestavěný WebRTC přehrávač využívající přihlášenou relaci my.dlink.com
+        // Vestavěný WebRTC přehrávač v desktopovém režimu bez lišt portálu
         AndroidView(
             factory = { ctx ->
                 WebView(ctx).apply {
                     CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
+                    settings.useWideViewPort = true
+                    settings.loadWithOverviewMode = true
                     settings.mediaPlaybackRequiresUserGesture = false
-                    webViewClient = WebViewClient()
+                    settings.userAgentString =
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            val cleanUiJs = """
+                                (function() {
+                                    var style = document.createElement('style');
+                                    style.innerHTML = 'header, nav, .navbar, .sidebar, .footer, [class*="banner"] { display: none !important; } body { background: #000 !important; overflow: hidden !important; } video { object-fit: cover !important; width: 100% !important; height: 100% !important; }';
+                                    document.head.appendChild(style);
+                                })();
+                            """.trimIndent()
+                            view?.evaluateJavascript(cleanUiJs, null)
+                        }
+                    }
                     loadUrl(MydlinkClient.MYDLINK_WEB_PORTAL_URL)
                 }
             },
