@@ -225,7 +225,7 @@ object MydlinkClient {
 
     fun normalizeSiteUrl(rawSite: String?): String {
         val cleaned = rawSite?.trim()?.removeSuffix("/")
-        if (cleaned.isNullOrEmpty() || cleaned == "https://portal.mydlink.com" || cleaned == "portal.mydlink.com") {
+        if (cleaned.isNullOrEmpty() || cleaned.contains("portal.mydlink.com")) {
             return DEFAULT_EU_SITE
         }
         val withScheme = if (cleaned.startsWith("http")) cleaned else "https://$cleaned"
@@ -250,48 +250,36 @@ object MydlinkClient {
         val candidateSites = listOf(
             siteUrl,
             "https://mp-eu-openapi.auto.mydlink.com",
-            "https://mp-openapi.auto.mydlink.com",
             "https://api.auto.mydlink.com"
         ).distinct()
 
-        val candidatePaths = listOf(
-            "/me/device/list",
-            "/v1/me/device/list",
-            "/v2/me/device/list"
-        )
-
         var deviceArray: JSONArray? = null
         var workingBase = siteUrl
-        var apiPrefix = ""
 
         for (base in candidateSites) {
-            for (path in candidatePaths) {
-                val url = "$base$path"
-                try {
-                    val raw = api.getRawJson(url, "Bearer $token").string()
-                    val root = JSONObject(raw)
-                    val arr = root.optJSONArray("data")
-                        ?: root.optJSONObject("data")?.optJSONArray("devices")
-                        ?: root.optJSONArray("devices")
-                    if (arr != null && arr.length() > 0) {
-                        deviceArray = arr
-                        workingBase = base
-                        apiPrefix = path.removeSuffix("/me/device/list")
-                        log.append("OK: $url (nalezeno ${arr.length()} kamer)\n")
-                        break
-                    } else {
-                        log.append("Prázdná odpověď z $url: ${raw.take(150)}\n")
-                    }
-                } catch (e: Exception) {
-                    val errDetail = if (e is HttpException) {
-                        "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(120)}"
-                    } else {
-                        e.message ?: "Neznámá chyba"
-                    }
-                    log.append("Chyba $url -> $errDetail\n")
+            val url = "$base/me/device/list"
+            try {
+                val raw = api.getRawJson(url, "Bearer $token").string()
+                val root = JSONObject(raw)
+                val arr = root.optJSONArray("data")
+                    ?: root.optJSONObject("data")?.optJSONArray("devices")
+                    ?: root.optJSONArray("devices")
+                if (arr != null && arr.length() > 0) {
+                    deviceArray = arr
+                    workingBase = base
+                    log.append("OK: $url (nalezeno ${arr.length()} kamer)\n")
+                    break
+                } else {
+                    log.append("Prázdná odpověď z $url: ${raw.take(180)}\n")
                 }
+            } catch (e: Exception) {
+                val errDetail = if (e is HttpException) {
+                    "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(140)}"
+                } else {
+                    e.message ?: "Neznámá chyba"
+                }
+                log.append("Chyba $url -> $errDetail\n")
             }
-            if (deviceArray != null) break
         }
 
         if (deviceArray == null) {
@@ -316,18 +304,29 @@ object MydlinkClient {
             var streamId: String? = null
             var streamNote = ""
 
+            // 1. Zjistíme detailní info o zařízení (často obsahuje relay / local IP / stream endpoints)
+            try {
+                val infoRaw = api.postRawJsonBody(
+                    "$workingBase/me/device/info",
+                    "Bearer $token",
+                    """{"mydlink_id":"$id"}""".toRequestBody(jsonMediaType)
+                ).string()
+                log.append("Info $name: ${infoRaw.take(220)}\n")
+            } catch (e: Exception) {
+                log.append("Info $name chyba: ${e.message}\n")
+            }
+
+            // 2. Zkusíme spustit živý stream
             val streamPaths = listOf(
-                "$workingBase$apiPrefix/device/stream/start",
                 "$workingBase/device/stream/start",
-                "$workingBase/v1/device/stream/start",
-                "$workingBase/v2/device/stream/start",
-                "$workingBase/device/live/start"
-            ).distinct()
+                "$workingBase/device/live/start",
+                "$workingBase/device/media/live"
+            )
 
             val payloads = listOf(
                 """{"mydlink_id":"$id","profile":"sub"}""",
                 """{"mydlink_id":"$id","stream_type":"flv"}""",
-                """{"device_id":"$id"}"""
+                """{"mydlink_id":"$id"}"""
             )
 
             outer@ for (sUrl in streamPaths) {
@@ -351,11 +350,11 @@ object MydlinkClient {
                             log.append("Stream $name ($model): OK ($foundUrl)\n")
                             break@outer
                         } else {
-                            streamNote = sRaw.take(160)
+                            streamNote = sRaw.take(180)
                         }
                     } catch (e: Exception) {
                         streamNote = if (e is HttpException) {
-                            "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(100)}"
+                            "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(120)}"
                         } else {
                             e.message ?: "Chyba streamu"
                         }
@@ -1027,7 +1026,7 @@ fun MydlinkWebOAuthDialog(
     onTokenCaptured: (String, String?) -> Unit
 ) {
     val alreadyCaptured = remember { AtomicBoolean(false) }
-    var statusHint by remember { mutableStateOf("Přihlaste se na stránce mydlink níže...") }
+    var statusHint by remember { mutableStateOf("Vyplňte přihlašovací údaje mydlink níže...") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1056,11 +1055,11 @@ fun MydlinkWebOAuthDialog(
 
                             addJavascriptInterface(object {
                                 @JavascriptInterface
-                                fun onBearerIntercepted(token: String?, requestUrl: String?) {
+                                fun onUserTokenCaptured(token: String?, siteOrUrl: String?) {
                                     if (!token.isNullOrBlank() && token.length > 15 && alreadyCaptured.compareAndSet(false, true)) {
                                         post {
-                                            statusHint = "Token zachycen! Načítám kamery..."
-                                            onTokenCaptured(token, requestUrl)
+                                            statusHint = "Přihlášení potvrzeno! Načítám kamery..."
+                                            onTokenCaptured(token, siteOrUrl)
                                         }
                                     }
                                 }
@@ -1074,14 +1073,18 @@ fun MydlinkWebOAuthDialog(
                                     val reqUrl = request?.url?.toString() ?: return null
                                     val authHeader = request.requestHeaders?.get("Authorization")
                                         ?: request.requestHeaders?.get("authorization")
+                                    // Zachytíme POUZE požadavky na uživatelské endpointy (/me/ nebo /device/),
+                                    // nikoliv předběžný anonymní client_credentials token!
+                                    val isUserEndpoint = reqUrl.contains("/me/") || reqUrl.contains("/device/")
                                     if (!authHeader.isNullOrBlank() &&
                                         authHeader.startsWith("Bearer ", ignoreCase = true) &&
-                                        reqUrl.contains("mydlink.com")
+                                        reqUrl.contains("mydlink.com") &&
+                                        isUserEndpoint
                                     ) {
                                         val token = authHeader.substring(7).trim()
                                         if (token.length > 15 && alreadyCaptured.compareAndSet(false, true)) {
                                             view?.post {
-                                                statusHint = "Token zachycen! Načítám kamery..."
+                                                statusHint = "Přihlášení potvrzeno! Načítám kamery..."
                                                 onTokenCaptured(token, reqUrl)
                                             }
                                         }
@@ -1091,40 +1094,68 @@ fun MydlinkWebOAuthDialog(
 
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     super.onPageFinished(view, url)
-                                    // Zachytí Authorization: Bearer přímo z fetch() a XMLHttpRequest po přihlášení
                                     val hookScript = """
                                         (function() {
                                             if (window.__mydlinkHooked) return;
                                             window.__mydlinkHooked = true;
+                                            
+                                            function inspectTokenPayload(text, reqUrl) {
+                                                try {
+                                                    var data = JSON.parse(text);
+                                                    // Skutečný uživatelský login vždy vrací refresh_token nebo api_site
+                                                    if (data && data.access_token && (data.refresh_token || data.api_site)) {
+                                                        AndroidOAuthBridge.onUserTokenCaptured(data.access_token, data.api_site || reqUrl);
+                                                    }
+                                                } catch(e) {}
+                                            }
+
                                             var origFetch = window.fetch;
                                             window.fetch = function(input, init) {
+                                                var u = (typeof input === 'string') ? input : (input && input.url);
                                                 try {
-                                                    var u = (typeof input === 'string') ? input : (input && input.url);
                                                     var h = init && init.headers;
                                                     var auth = null;
                                                     if (h) {
                                                         if (typeof h.get === 'function') auth = h.get('Authorization') || h.get('authorization');
                                                         else auth = h['Authorization'] || h['authorization'];
                                                     }
-                                                    if (auth && auth.toLowerCase().indexOf('bearer ') === 0 && u && u.indexOf('mydlink.com') !== -1) {
-                                                        AndroidOAuthBridge.onBearerIntercepted(auth.substring(7).trim(), u);
+                                                    if (auth && auth.toLowerCase().indexOf('bearer ') === 0 && u && (u.indexOf('/me/') !== -1 || u.indexOf('/device/') !== -1)) {
+                                                        AndroidOAuthBridge.onUserTokenCaptured(auth.substring(7).trim(), u);
                                                     }
                                                 } catch(e) {}
-                                                return origFetch.apply(this, arguments);
+                                                return origFetch.apply(this, arguments).then(function(resp) {
+                                                    try {
+                                                        if (u && u.indexOf('mydlink.com') !== -1) {
+                                                            resp.clone().text().then(function(txt) { inspectTokenPayload(txt, u); });
+                                                        }
+                                                    } catch(e) {}
+                                                    return resp;
+                                                });
                                             };
+
                                             var origOpen = XMLHttpRequest.prototype.open;
                                             var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+                                            var origSend = XMLHttpRequest.prototype.send;
                                             XMLHttpRequest.prototype.open = function(method, url) {
                                                 this.__reqUrl = url;
                                                 return origOpen.apply(this, arguments);
                                             };
                                             XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
                                                 if (header && header.toLowerCase() === 'authorization' && value && value.toLowerCase().indexOf('bearer ') === 0) {
-                                                    if (this.__reqUrl && this.__reqUrl.indexOf('mydlink.com') !== -1) {
-                                                        AndroidOAuthBridge.onBearerIntercepted(value.substring(7).trim(), this.__reqUrl);
+                                                    if (this.__reqUrl && (this.__reqUrl.indexOf('/me/') !== -1 || this.__reqUrl.indexOf('/device/') !== -1)) {
+                                                        AndroidOAuthBridge.onUserTokenCaptured(value.substring(7).trim(), this.__reqUrl);
                                                     }
                                                 }
                                                 return origSetHeader.apply(this, arguments);
+                                            };
+                                            XMLHttpRequest.prototype.send = function() {
+                                                var self = this;
+                                                this.addEventListener('load', function() {
+                                                    if (self.__reqUrl && self.__reqUrl.indexOf('mydlink.com') !== -1 && typeof self.responseText === 'string') {
+                                                        inspectTokenPayload(self.responseText, self.__reqUrl);
+                                                    }
+                                                });
+                                                return origSend.apply(this, arguments);
                                             };
                                         })();
                                     """.trimIndent()
