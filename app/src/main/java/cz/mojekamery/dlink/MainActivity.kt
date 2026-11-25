@@ -9,12 +9,13 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
@@ -62,6 +63,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.app.NotificationCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -70,336 +73,19 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.work.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.RequestBody
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.ResponseBody
-import okhttp3.logging.HttpLoggingInterceptor
 import org.json.JSONArray
 import org.json.JSONObject
-import retrofit2.HttpException
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.*
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-
-// ============================================================================
-// 1. DATOVÉ MODELY A MYDLINK API (Retrofit)
-// ============================================================================
-
-data class AuthResponse(
-    val access_token: String,
-    val refresh_token: String?,
-    val expires_in: Long?,
-    val api_site: String?
-)
-
-data class StreamKeepAliveRequest(
-    val mydlink_id: String,
-    val stream_id: String
-)
-
-data class DeviceCommandRequest(
-    val mydlink_id: String,
-    val command: String,
-    val params: Map<String, String> = emptyMap()
-)
-
-data class DeviceSettingsRequest(
-    val mydlink_id: String,
-    val key: String,
-    val value: String
-)
-
-data class EventListResponse(
-    val data: List<CameraEventDto>?
-)
-
-data class CameraEventDto(
-    val event_id: String,
-    val mydlink_id: String,
-    val device_name: String,
-    val event_type: String,
-    val timestamp: Long
-)
-
-data class BaseResponse(
-    val status: String?
-)
-
-interface MydlinkApi {
-    @FormUrlEncoded
-    @POST
-    suspend fun loginAtUrl(
-        @Url loginUrl: String,
-        @Field("client_id") clientId: String = "mydlinkuap",
-        @Field("grant_type") grantType: String = "password",
-        @Field("username") email: String,
-        @Field("password") password: String
-    ): AuthResponse
-
-    @GET
-    suspend fun getRawJson(
-        @Url fullUrl: String,
-        @Header("Authorization") bearerToken: String
-    ): ResponseBody
-
-    @POST
-    suspend fun postRawJsonBody(
-        @Url fullUrl: String,
-        @Header("Authorization") bearerToken: String,
-        @Body body: RequestBody
-    ): ResponseBody
-
-    @POST
-    suspend fun keepStreamAlive(
-        @Url fullUrl: String,
-        @Header("Authorization") bearerToken: String,
-        @Body request: StreamKeepAliveRequest
-    ): BaseResponse
-
-    @POST
-    suspend fun sendCommand(
-        @Url fullUrl: String,
-        @Header("Authorization") bearerToken: String,
-        @Body request: DeviceCommandRequest
-    ): BaseResponse
-
-    @POST
-    suspend fun updateSetting(
-        @Url fullUrl: String,
-        @Header("Authorization") bearerToken: String,
-        @Body request: DeviceSettingsRequest
-    ): BaseResponse
-
-    @GET
-    suspend fun getEvents(
-        @Url fullUrl: String,
-        @Header("Authorization") bearerToken: String,
-        @Query("limit") limit: Int = 20
-    ): EventListResponse
-}
-
-data class LoadCamerasResult(
-    val cameras: List<CameraUiState>,
-    val diagnosticLog: String,
-    val usedFallback: Boolean
-)
-
-object MydlinkClient {
-    const val DEFAULT_EU_SITE = "https://mp-eu-openapi.auto.mydlink.com"
-    const val MYDLINK_WEB_PORTAL_URL = "https://portal.mydlink.com/"
-    const val DESKTOP_USER_AGENT =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-    val api: MydlinkApi by lazy {
-        val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BASIC
-        }
-        val client = OkHttpClient.Builder()
-            .addInterceptor { chain ->
-                val req = chain.request().newBuilder()
-                    .header("User-Agent", DESKTOP_USER_AGENT)
-                    .header("Origin", "https://portal.mydlink.com")
-                    .header("Referer", "https://portal.mydlink.com/")
-                    .header("Accept", "application/json")
-                    .build()
-                chain.proceed(req)
-            }
-            .addInterceptor(logging)
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
-            .build()
-
-        Retrofit.Builder()
-            .baseUrl("https://api.auto.mydlink.com/")
-            .client(client)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(MydlinkApi::class.java)
-    }
-
-    fun normalizeSiteUrl(rawSite: String?): String {
-        val cleaned = rawSite?.trim()?.removeSuffix("/")
-        if (cleaned.isNullOrEmpty() || cleaned.contains("portal.mydlink.com")) {
-            return DEFAULT_EU_SITE
-        }
-        val withScheme = if (cleaned.startsWith("http")) cleaned else "https://$cleaned"
-        return try {
-            val uri = Uri.parse(withScheme)
-            val host = uri.host ?: return DEFAULT_EU_SITE
-            "https://$host"
-        } catch (_: Exception) {
-            DEFAULT_EU_SITE
-        }
-    }
-
-    fun md5(input: String): String {
-        val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    suspend fun loadCamerasWithToken(
-        token: String,
-        siteUrl: String,
-        preloadedDevicesJson: String? = null
-    ): LoadCamerasResult {
-        val log = StringBuilder()
-        log.append("Token délka: ${token.length}, server: $siteUrl\n")
-
-        var deviceArray: JSONArray? = null
-        var workingBase = siteUrl
-
-        // 1. Pokud jsme zachytili JSON seznam kamer přímo z přihlášeného portálu, použijeme ho jako první
-        if (!preloadedDevicesJson.isNullOrBlank()) {
-            runCatching {
-                val root = JSONObject(preloadedDevicesJson)
-                val arr = root.optJSONArray("data")
-                    ?: root.optJSONObject("data")?.optJSONArray("devices")
-                    ?: root.optJSONArray("devices")
-                if (arr != null && arr.length() > 0) {
-                    deviceArray = arr
-                    log.append("OK: Načteno přímo z relace portálu (${arr.length()} kamer)\n")
-                }
-            }
-        }
-
-        // 2. Jinak se dotážeme REST API (zkusíme Bearer hlavičku i query parametr ?access_token=)
-        if (deviceArray == null) {
-            val candidateSites = listOf(
-                siteUrl,
-                "https://mp-eu-openapi.auto.mydlink.com",
-                "https://api.auto.mydlink.com"
-            ).distinct()
-
-            outerSearch@ for (base in candidateSites) {
-                val candidateUrls = listOf(
-                    "$base/me/device/list",
-                    "$base/me/device/list?access_token=$token"
-                )
-                for (url in candidateUrls) {
-                    try {
-                        val raw = api.getRawJson(url, "Bearer $token").string()
-                        val root = JSONObject(raw)
-                        val arr = root.optJSONArray("data")
-                            ?: root.optJSONObject("data")?.optJSONArray("devices")
-                            ?: root.optJSONArray("devices")
-                        if (arr != null && arr.length() > 0) {
-                            deviceArray = arr
-                            workingBase = base
-                            log.append("OK: $url (nalezeno ${arr.length()} kamer)\n")
-                            break@outerSearch
-                        } else {
-                            log.append("Prázdná odpověď z $url: ${raw.take(180)}\n")
-                        }
-                    } catch (e: Exception) {
-                        val errDetail = if (e is HttpException) {
-                            "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(140)}"
-                        } else {
-                            e.message ?: "Neznámá chyba"
-                        }
-                        log.append("Chyba $url -> $errDetail\n")
-                    }
-                }
-            }
-        }
-
-        if (deviceArray == null) {
-            return LoadCamerasResult(
-                cameras = defaultUserCameras(),
-                diagnosticLog = log.toString(),
-                usedFallback = true
-            )
-        }
-
-        val resultList = mutableListOf<CameraUiState>()
-        val jsonMediaType = "application/json; charset=utf-8".toMediaType()
-
-        for (i in 0 until deviceArray!!.length()) {
-            val item = deviceArray!!.getJSONObject(i)
-            val id = item.optString("mydlink_id").ifEmpty { item.optString("device_id") }
-            val name = item.optString("device_name").ifEmpty { item.optString("name", "Kamera ${i + 1}") }
-            val model = item.optString("model", "DCS-LH")
-            val online = item.optBoolean("online", true)
-
-            var streamUrl: String? = null
-            var streamId: String? = null
-            var streamNote = ""
-
-            val streamPaths = listOf(
-                "$workingBase/device/stream/start",
-                "$workingBase/device/stream/start?access_token=$token",
-                "$workingBase/device/live/start"
-            )
-
-            val payloads = listOf(
-                """{"mydlink_id":"$id","profile":"sub"}""",
-                """{"mydlink_id":"$id"}"""
-            )
-
-            outer@ for (sUrl in streamPaths) {
-                for (payload in payloads) {
-                    try {
-                        val sRaw = api.postRawJsonBody(
-                            sUrl,
-                            "Bearer $token",
-                            payload.toRequestBody(jsonMediaType)
-                        ).string()
-                        val sObj = JSONObject(sRaw)
-                        val dataObj = sObj.optJSONObject("data") ?: sObj
-                        val foundUrl = dataObj.optString("url")
-                            .ifEmpty { dataObj.optString("flv_url") }
-                            .ifEmpty { dataObj.optString("hls_url") }
-                            .ifEmpty { dataObj.optString("rtsp_url") }
-                            .ifEmpty { dataObj.optString("stream_url") }
-                        streamId = dataObj.optString("stream_id").ifEmpty { null }
-                        if (foundUrl.isNotEmpty()) {
-                            streamUrl = foundUrl
-                            log.append("Stream $name ($model): OK ($foundUrl)\n")
-                            break@outer
-                        } else {
-                            streamNote = "WebRTC Cloud tunel"
-                        }
-                    } catch (_: Exception) {
-                        streamNote = "WebRTC Cloud tunel"
-                    }
-                }
-            }
-
-            if (streamUrl == null) {
-                log.append("Stream $name ($model): aktivní přes WebRTC portál\n")
-            }
-
-            resultList.add(
-                CameraUiState(
-                    id = id,
-                    name = name,
-                    model = model,
-                    isOnline = online,
-                    streamUrl = streamUrl,
-                    streamId = streamId,
-                    streamStatusNote = streamNote
-                )
-            )
-        }
-
-        return LoadCamerasResult(
-            cameras = resultList,
-            diagnosticLog = log.toString(),
-            usedFallback = false
-        )
-    }
-}
-
-// ============================================================================
-// 2. APLIKAČNÍ STAV KAMER A UDÁLOSTÍ
-// ============================================================================
 
 data class CameraUiState(
     val id: String,
@@ -408,7 +94,6 @@ data class CameraUiState(
     val isOnline: Boolean = true,
     val streamUrl: String? = null,
     val streamId: String? = null,
-    val streamStatusNote: String = "",
     val muted: Boolean = true,
     val privacyMode: Boolean = false,
     val motionEnabled: Boolean = true,
@@ -421,6 +106,12 @@ data class CameraUiState(
     val supportsOutdoorGear: Boolean get() = model.contains("8620")
 }
 
+data class CameraLoadResult(
+    val cameras: List<CameraUiState>,
+    val diagnosticLog: String,
+    val usedFallback: Boolean
+)
+
 enum class GridMode(val label: String, val columns: Int, val maxCount: Int) {
     SINGLE("1x1", 1, 1),
     DUAL("2x1", 1, 2),
@@ -428,15 +119,220 @@ enum class GridMode(val label: String, val columns: Int, val maxCount: Int) {
 }
 
 fun defaultUserCameras(): List<CameraUiState> = listOf(
-    CameraUiState(id = "dcs-6500lh-1", name = "Obývák", model = "DCS-6500LH"),
+    CameraUiState(id = "dcs-6500lh-1", name = "Dětský pokoj", model = "DCS-6500LH"),
+    CameraUiState(id = "dcs-6501lh-1", name = "Obývák", model = "DCS-6501LH", motionSensitivity = 65),
     CameraUiState(id = "dcs-8620lh-1", name = "Zahrada", model = "DCS-8620LH", motionSensitivity = 85),
-    CameraUiState(id = "dcs-6501lh-1", name = "Chodba", model = "DCS-6501LH", motionSensitivity = 60),
-    CameraUiState(id = "dcs-6501lh-2", name = "Garáž", model = "DCS-6501LH", nightVision = "ON")
+    CameraUiState(id = "dcs-6501lh-2", name = "Chodba", model = "DCS-6501LH", nightVision = "ON")
 )
 
-// ============================================================================
-// 3. WORKMANAGER PRO PUSH NOTIFIKACE NA POZADÍ
-// ============================================================================
+object MydlinkClient {
+    const val MYDLINK_WEB_PORTAL_URL = "https://portal.mydlink.com/"
+    const val DEFAULT_EU_API_SITE = "https://mp-eu-openapi.auto.mydlink.com"
+    const val DESKTOP_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    val httpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .build()
+    }
+
+    fun normalizeSiteUrl(rawUrl: String?): String {
+        if (rawUrl.isNullOrBlank()) return DEFAULT_EU_API_SITE
+        return try {
+            val clean = rawUrl.trim()
+            if (clean.contains("portal.mydlink.com")) {
+                DEFAULT_EU_API_SITE
+            } else if (clean.startsWith("http")) {
+                val uri = java.net.URI(clean)
+                "${uri.scheme}://${uri.host}"
+            } else {
+                DEFAULT_EU_API_SITE
+            }
+        } catch (_: Exception) {
+            DEFAULT_EU_API_SITE
+        }
+    }
+
+    fun md5(input: String): String {
+        val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray())
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    fun parseDevicesFromJson(rawJson: String): List<CameraUiState> {
+        val result = mutableListOf<CameraUiState>()
+        try {
+            val root = JSONObject(rawJson)
+            val dataArray: JSONArray? = when {
+                root.has("data") && root.get("data") is JSONArray -> root.getJSONArray("data")
+                root.has("data") && root.get("data") is JSONObject -> {
+                    val d = root.getJSONObject("data")
+                    d.optJSONArray("device_list") ?: d.optJSONArray("devices") ?: d.optJSONArray("list")
+                }
+                root.has("device_list") -> root.getJSONArray("device_list")
+                root.has("devices") -> root.getJSONArray("devices")
+                else -> null
+            }
+            if (dataArray != null) {
+                for (i in 0 until dataArray.length()) {
+                    val item = dataArray.optJSONObject(i) ?: continue
+                    val id = item.optString("mydlink_id").ifBlank {
+                        item.optString("device_id").ifBlank { item.optString("id") }
+                    }
+                    val name = item.optString("device_name").ifBlank {
+                        item.optString("name").ifBlank { "Kamera ${i + 1}" }
+                    }
+                    val model = item.optString("model").ifBlank {
+                        item.optString("model_name").ifBlank { "DCS-6500LH" }
+                    }
+                    val online = item.optBoolean("online", true)
+                    if (id.isNotBlank() || name.isNotBlank()) {
+                        result.add(
+                            CameraUiState(
+                                id = id.ifBlank { "cam_${i + 1}_${name.hashCode()}" },
+                                name = name,
+                                model = model,
+                                isOnline = online
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return result
+    }
+
+    suspend fun loadCamerasWithToken(
+        token: String,
+        preferredSite: String?
+    ): CameraLoadResult = withContext(Dispatchers.IO) {
+        val logs = StringBuilder()
+        val baseSite = normalizeSiteUrl(preferredSite)
+        val candidateUrls = listOf(
+            "$baseSite/me/device/list",
+            "$baseSite/v1/me/device/list",
+            "https://mp-eu-openapi.auto.mydlink.com/me/device/list",
+            "https://api.auto.mydlink.com/me/device/list"
+        ).distinct()
+
+        logs.appendLine("Token délka: ${token.length}, server: $baseSite")
+
+        for (url in candidateUrls) {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .get()
+                    .addHeader("Authorization", "Bearer $token")
+                    .addHeader("Origin", "https://portal.mydlink.com")
+                    .addHeader("Referer", "https://portal.mydlink.com/")
+                    .addHeader("Accept", "application/json")
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    val bodyStr = response.body?.string().orEmpty()
+                    if (response.isSuccessful && bodyStr.isNotBlank()) {
+                        val parsed = parseDevicesFromJson(bodyStr)
+                        if (parsed.isNotEmpty()) {
+                            logs.appendLine("OK $url -> nalezeno ${parsed.size} kamer")
+                            return@withContext CameraLoadResult(
+                                cameras = parsed,
+                                diagnosticLog = logs.toString(),
+                                usedFallback = false
+                            )
+                        } else {
+                            logs.appendLine("200 OK bez kamer z $url: ${bodyStr.take(180)}")
+                        }
+                    } else {
+                        logs.appendLine("Chyba $url -> HTTP ${response.code}: ${bodyStr.take(150)}")
+                    }
+                }
+            } catch (e: Exception) {
+                logs.appendLine("Chyba $url -> ${e.localizedMessage}")
+            }
+        }
+
+        CameraLoadResult(
+            cameras = defaultUserCameras(),
+            diagnosticLog = logs.toString(),
+            usedFallback = true
+        )
+    }
+
+    suspend fun sendCommand(
+        token: String,
+        apiSite: String?,
+        cameraId: String,
+        command: String,
+        params: Map<String, String> = emptyMap()
+    ) = withContext(Dispatchers.IO) {
+        val base = normalizeSiteUrl(apiSite)
+        val payload = JSONObject().apply {
+            put("mydlink_id", cameraId)
+            put("command", command)
+            put("params", JSONObject(params))
+        }.toString()
+
+        val req = Request.Builder()
+            .url("$base/device/control")
+            .post(payload.toRequestBody(jsonMediaType))
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("Origin", "https://portal.mydlink.com")
+            .addHeader("Referer", "https://portal.mydlink.com/")
+            .build()
+
+        runCatching { httpClient.newCall(req).execute().close() }
+    }
+
+    suspend fun updateSetting(
+        token: String,
+        apiSite: String?,
+        cameraId: String,
+        key: String,
+        value: String
+    ) = withContext(Dispatchers.IO) {
+        val base = normalizeSiteUrl(apiSite)
+        val payload = JSONObject().apply {
+            put("mydlink_id", cameraId)
+            put("key", key)
+            put("value", value)
+        }.toString()
+
+        val req = Request.Builder()
+            .url("$base/device/setting")
+            .post(payload.toRequestBody(jsonMediaType))
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("Origin", "https://portal.mydlink.com")
+            .addHeader("Referer", "https://portal.mydlink.com/")
+            .build()
+
+        runCatching { httpClient.newCall(req).execute().close() }
+    }
+
+    suspend fun keepStreamAlive(
+        token: String,
+        apiSite: String?,
+        cameraId: String,
+        streamId: String
+    ) = withContext(Dispatchers.IO) {
+        val base = normalizeSiteUrl(apiSite)
+        val payload = JSONObject().apply {
+            put("mydlink_id", cameraId)
+            put("stream_id", streamId)
+        }.toString()
+
+        val req = Request.Builder()
+            .url("$base/device/stream/keepalive")
+            .post(payload.toRequestBody(jsonMediaType))
+            .addHeader("Authorization", "Bearer $token")
+            .build()
+
+        runCatching { httpClient.newCall(req).execute().close() }
+    }
+}
 
 class EventCheckWorker(
     context: Context,
@@ -446,15 +342,40 @@ class EventCheckWorker(
     override suspend fun doWork(): Result {
         val prefs = applicationContext.getSharedPreferences("mydlink_prefs", Context.MODE_PRIVATE)
         val token = prefs.getString("access_token", null) ?: return Result.success()
-        val apiSite = prefs.getString("api_site", MydlinkClient.DEFAULT_EU_SITE) ?: MydlinkClient.DEFAULT_EU_SITE
+        if (token == "demo_local_token") return Result.success()
+
+        val apiSite = MydlinkClient.normalizeSiteUrl(prefs.getString("api_site", null))
         val lastTs = prefs.getLong("last_event_ts", System.currentTimeMillis())
 
         return try {
-            val response = MydlinkClient.api.getEvents("$apiSite/me/event/list", "Bearer $token")
-            val events = response.data.orEmpty().filter { it.timestamp > lastTs }
-            if (events.isNotEmpty()) {
-                prefs.edit().putLong("last_event_ts", events.maxOf { it.timestamp }).apply()
-                events.forEach { sendSystemNotification(applicationContext, it.event_id.hashCode(), it.device_name, it.event_type) }
+            val req = Request.Builder()
+                .url("$apiSite/me/event/list?limit=15")
+                .get()
+                .addHeader("Authorization", "Bearer $token")
+                .build()
+
+            MydlinkClient.httpClient.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (resp.isSuccessful && body.isNotBlank()) {
+                    val arr = JSONObject(body).optJSONArray("data")
+                    var maxTs = lastTs
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val ev = arr.optJSONObject(i) ?: continue
+                            val ts = ev.optLong("timestamp", 0L)
+                            if (ts > lastTs) {
+                                if (ts > maxTs) maxTs = ts
+                                val evId = ev.optString("event_id", "ev_$i").hashCode()
+                                val devName = ev.optString("device_name", "Kamera mydlink")
+                                val evType = ev.optString("event_type", "motion")
+                                sendSystemNotification(applicationContext, evId, devName, evType)
+                            }
+                        }
+                    }
+                    if (maxTs > lastTs) {
+                        prefs.edit().putLong("last_event_ts", maxTs).apply()
+                    }
+                }
             }
             Result.success()
         } catch (_: Exception) {
@@ -502,10 +423,6 @@ fun sendSystemNotification(context: Context, id: Int, cameraName: String, type: 
     manager.notify(id, notification)
 }
 
-// ============================================================================
-// 4. HLAVNÍ AKTIVITA A JETPACK COMPOSE UI
-// ============================================================================
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -542,11 +459,8 @@ fun MojeKameryApp() {
     val prefs = remember { context.getSharedPreferences("mydlink_prefs", Context.MODE_PRIVATE) }
 
     var accessToken by remember { mutableStateOf(prefs.getString("access_token", null)) }
-    var apiSite by remember { mutableStateOf(prefs.getString("api_site", MydlinkClient.DEFAULT_EU_SITE) ?: MydlinkClient.DEFAULT_EU_SITE) }
+    var apiSite by remember { mutableStateOf(prefs.getString("api_site", MydlinkClient.DEFAULT_EU_API_SITE)) }
     var cameras by remember { mutableStateOf(defaultUserCameras()) }
-    var diagnosticLog by remember { mutableStateOf("") }
-    var isRefreshingStreams by remember { mutableStateOf(false) }
-
     var gridMode by remember { mutableStateOf(GridMode.QUAD) }
     var selectedSingleId by remember { mutableStateOf("dcs-6500lh-1") }
     var keepAwake by remember { mutableStateOf(true) }
@@ -555,29 +469,15 @@ fun MojeKameryApp() {
     var settingsCameraId by remember { mutableStateOf<String?>(null) }
     var fullscreenCameraId by remember { mutableStateOf<String?>(null) }
     var showNotificationsSheet by remember { mutableStateOf(false) }
+    var diagnosticLog by remember { mutableStateOf("Zatím neproběhlo žádné volání API.") }
     var showDiagnosticDialog by remember { mutableStateOf(false) }
+    var isRefreshingStreams by remember { mutableStateOf(false) }
 
     val snackbarHostState = remember { SnackbarHostState() }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
-
-    LaunchedEffect(accessToken) {
-        val token = accessToken
-        if (token != null && token != "demo_local_token" && token != "web_session_token") {
-            isRefreshingStreams = true
-            val res = MydlinkClient.loadCamerasWithToken(token, apiSite)
-            if (!res.usedFallback) {
-                cameras = res.cameras
-                if (res.cameras.isNotEmpty()) {
-                    selectedSingleId = res.cameras.first().id
-                }
-            }
-            diagnosticLog = res.diagnosticLog
-            isRefreshingStreams = false
-        }
-    }
 
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -595,22 +495,18 @@ fun MojeKameryApp() {
 
     KeepScreenAwake(enabled = accessToken != null && keepAwake)
 
-    LaunchedEffect(accessToken, apiSite) {
+    LaunchedEffect(accessToken) {
         if (accessToken == null) return@LaunchedEffect
         while (isActive) {
             delay(1000L)
             if (keepAliveCountdown <= 1) {
                 keepAliveCountdown = 45
                 val token = accessToken ?: continue
-                cameras.forEach { cam ->
-                    val sId = cam.streamId
-                    if (sId != null) {
-                        runCatching {
-                            MydlinkClient.api.keepStreamAlive(
-                                "$apiSite/device/stream/keepalive",
-                                "Bearer $token",
-                                StreamKeepAliveRequest(cam.id, sId)
-                            )
+                if (token != "demo_local_token") {
+                    cameras.forEach { cam ->
+                        val sId = cam.streamId
+                        if (sId != null) {
+                            MydlinkClient.keepStreamAlive(token, apiSite, cam.id, sId)
                         }
                     }
                 }
@@ -622,27 +518,17 @@ fun MojeKameryApp() {
 
     fun sendApiCommand(camId: String, command: String, params: Map<String, String> = emptyMap()) {
         val token = accessToken ?: return
+        if (token == "demo_local_token") return
         scope.launch {
-            runCatching {
-                MydlinkClient.api.sendCommand(
-                    "$apiSite/device/control",
-                    "Bearer $token",
-                    DeviceCommandRequest(camId, command, params)
-                )
-            }
+            MydlinkClient.sendCommand(token, apiSite, camId, command, params)
         }
     }
 
     fun sendApiSetting(camId: String, key: String, value: String) {
         val token = accessToken ?: return
+        if (token == "demo_local_token") return
         scope.launch {
-            runCatching {
-                MydlinkClient.api.updateSetting(
-                    "$apiSite/device/setting",
-                    "Bearer $token",
-                    DeviceSettingsRequest(camId, key, value)
-                )
-            }
+            MydlinkClient.updateSetting(token, apiSite, camId, key, value)
         }
     }
 
@@ -653,17 +539,18 @@ fun MojeKameryApp() {
         Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
             if (accessToken == null) {
                 LoginScreen(
-                    onLoginSuccess = { token, siteUrl, loadResult ->
+                    onLoginSuccess = { token, siteUrl, loadedCameras, diag ->
+                        val cleanSite = MydlinkClient.normalizeSiteUrl(siteUrl)
                         prefs.edit()
                             .putString("access_token", token)
-                            .putString("api_site", siteUrl)
+                            .putString("api_site", cleanSite)
                             .apply()
                         accessToken = token
-                        apiSite = siteUrl
-                        cameras = loadResult.cameras
-                        diagnosticLog = loadResult.diagnosticLog
-                        if (loadResult.cameras.isNotEmpty()) {
-                            selectedSingleId = loadResult.cameras.first().id
+                        apiSite = cleanSite
+                        diagnosticLog = diag
+                        if (loadedCameras.isNotEmpty()) {
+                            cameras = loadedCameras
+                            selectedSingleId = loadedCameras.first().id
                         }
                     }
                 )
@@ -674,9 +561,23 @@ fun MojeKameryApp() {
                     selectedSingleId = selectedSingleId,
                     keepAwake = keepAwake,
                     keepAliveSeconds = keepAliveCountdown,
-                    isRefreshingStreams = isRefreshingStreams,
+                    isRefreshing = isRefreshingStreams,
                     onGridModeChange = { gridMode = it },
                     onSelectSingleCamera = { selectedSingleId = it },
+                    onRefreshStreams = {
+                        val token = accessToken ?: return@DashboardScreen
+                        scope.launch {
+                            isRefreshingStreams = true
+                            val res = MydlinkClient.loadCamerasWithToken(token, apiSite)
+                            if (!res.usedFallback && res.cameras.isNotEmpty()) {
+                                cameras = res.cameras
+                            }
+                            diagnosticLog = res.diagnosticLog
+                            isRefreshingStreams = false
+                            snackbarHostState.showSnackbar("Streamy obnoveny")
+                        }
+                    },
+                    onOpenDiagnostics = { showDiagnosticDialog = true },
                     onToggleKeepAwake = {
                         keepAwake = !keepAwake
                         scope.launch {
@@ -686,18 +587,6 @@ fun MojeKameryApp() {
                             )
                         }
                     },
-                    onRefreshStreams = {
-                        val token = accessToken ?: return@DashboardScreen
-                        scope.launch {
-                            isRefreshingStreams = true
-                            val res = MydlinkClient.loadCamerasWithToken(token, apiSite)
-                            cameras = res.cameras
-                            diagnosticLog = res.diagnosticLog
-                            isRefreshingStreams = false
-                            snackbarHostState.showSnackbar("Streamy obnoveny")
-                        }
-                    },
-                    onShowDiagnostics = { showDiagnosticDialog = true },
                     onToggleMute = { camId ->
                         cameras = cameras.map {
                             if (it.id == camId) it.copy(muted = !it.muted) else it.copy(muted = true)
@@ -729,7 +618,9 @@ fun MojeKameryApp() {
                     onOpenSettings = { settingsCameraId = it },
                     onOpenNotifications = { showNotificationsSheet = true },
                     onLogout = {
-                        prefs.edit().remove("access_token").apply()
+                        CookieManager.getInstance().removeAllCookies(null)
+                        CookieManager.getInstance().flush()
+                        prefs.edit().remove("access_token").remove("api_site").apply()
                         accessToken = null
                     }
                 )
@@ -805,14 +696,16 @@ fun MojeKameryApp() {
                     text = {
                         Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                             Text(
-                                diagnosticLog.ifEmpty { "Zatím bez záznamu. Zkuste obnovit streamy." },
-                                fontSize = 11.sp,
+                                text = diagnosticLog,
+                                fontSize = 12.sp,
                                 color = Color(0xFFD1D5DB)
                             )
                         }
                     },
                     confirmButton = {
-                        TextButton(onClick = { showDiagnosticDialog = false }) { Text("Zavřít") }
+                        TextButton(onClick = { showDiagnosticDialog = false }) {
+                            Text("Zavřít")
+                        }
                     }
                 )
             }
@@ -820,13 +713,9 @@ fun MojeKameryApp() {
     }
 }
 
-// ============================================================================
-// 5. PŘIHLAŠOVACÍ OBRAZOVKA + OFICIÁLNÍ MYDLINK WEB PORTÁL OAUTH2
-// ============================================================================
-
 @Composable
 fun LoginScreen(
-    onLoginSuccess: (String, String, LoadCamerasResult) -> Unit
+    onLoginSuccess: (String, String?, List<CameraUiState>, String) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var email by remember { mutableStateOf("") }
@@ -837,23 +726,33 @@ fun LoginScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showWebOAuth by remember { mutableStateOf(false) }
 
+    fun completeLoginWithToken(token: String, siteUrl: String?, prefetchedCameras: List<CameraUiState> = emptyList()) {
+        isLoading = true
+        errorMessage = null
+        scope.launch {
+            val result = MydlinkClient.loadCamerasWithToken(token, siteUrl)
+            val finalCameras = when {
+                prefetchedCameras.isNotEmpty() -> prefetchedCameras
+                !result.usedFallback && result.cameras.isNotEmpty() -> result.cameras
+                else -> defaultUserCameras()
+            }
+            isLoading = false
+            onLoginSuccess(
+                token,
+                siteUrl,
+                finalCameras,
+                result.diagnosticLog + "\nNačtené kamery: ${finalCameras.joinToString { "${it.name} (${it.model})" }}"
+            )
+        }
+    }
+
     if (showWebOAuth) {
         MydlinkWebOAuthDialog(
-            onDismiss = { showWebOAuth = false },
-            onTokenCaptured = { capturedToken, capturedSite, devicesJson ->
+            onTokenReceived = { token, siteUrl, prefetchedCameras ->
                 showWebOAuth = false
-                isLoading = true
-                scope.launch {
-                    val siteUrl = MydlinkClient.normalizeSiteUrl(capturedSite)
-                    val loaded = MydlinkClient.loadCamerasWithToken(
-                        token = capturedToken,
-                        siteUrl = siteUrl,
-                        preloadedDevicesJson = devicesJson
-                    )
-                    isLoading = false
-                    onLoginSuccess(capturedToken, siteUrl, loaded)
-                }
-            }
+                completeLoginWithToken(token, siteUrl, prefetchedCameras)
+            },
+            onDismiss = { showWebOAuth = false }
         )
     }
 
@@ -894,7 +793,7 @@ fun LoginScreen(
             color = Color(0xFF9CA3AF)
         )
 
-        Spacer(Modifier.height(22.dp))
+        Spacer(Modifier.height(24.dp))
 
         Button(
             onClick = { showWebOAuth = true },
@@ -902,17 +801,22 @@ fun LoginScreen(
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(14.dp)
         ) {
-            if (isLoading) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
-            } else {
-                Icon(Icons.Default.Language, contentDescription = null, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Přihlásit se přes mydlink účet (OAuth2)", fontWeight = FontWeight.Bold)
-            }
+            Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Přihlásit se přes mydlink účet (OAuth2)", fontWeight = FontWeight.SemiBold)
         }
 
         Spacer(Modifier.height(18.dp))
-        HorizontalDivider(color = Color(0xFF2B2E36))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            HorizontalDivider(modifier = Modifier.weight(1f), color = Color(0xFF2E323B))
+            Text("  nebo přímý přístup  ", fontSize = 11.sp, color = Color(0xFF6B7280))
+            HorizontalDivider(modifier = Modifier.weight(1f), color = Color(0xFF2E323B))
+        }
+
         Spacer(Modifier.height(14.dp))
 
         OutlinedTextField(
@@ -926,7 +830,7 @@ fun LoginScreen(
             shape = RoundedCornerShape(14.dp)
         )
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(12.dp))
 
         OutlinedTextField(
             value = password,
@@ -947,6 +851,8 @@ fun LoginScreen(
             shape = RoundedCornerShape(14.dp)
         )
 
+        Spacer(Modifier.height(8.dp))
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -960,77 +866,34 @@ fun LoginScreen(
                 errorMessage!!,
                 color = Color(0xFFF87171),
                 fontSize = 12.sp,
-                modifier = Modifier.padding(vertical = 4.dp)
+                modifier = Modifier.padding(vertical = 6.dp)
             )
         }
 
-        FilledTonalButton(
-            onClick = {
-                isLoading = true
-                errorMessage = null
-                scope.launch {
-                    try {
-                        val endpoints = listOf(
-                            "https://api.auto.mydlink.com/oauth/token",
-                            "https://mp-eu-openapi.auto.mydlink.com/oauth/token",
-                            "https://api.auto.mydlink.com/oauth/authorize2"
-                        )
-                        var authResult: AuthResponse? = null
-                        var lastErr: Exception? = null
-
-                        for (ep in endpoints) {
-                            try {
-                                authResult = MydlinkClient.api.loginAtUrl(
-                                    loginUrl = ep,
-                                    email = email.trim(),
-                                    password = MydlinkClient.md5(password)
-                                )
-                                break
-                            } catch (ex: Exception) {
-                                lastErr = ex
-                            }
-                        }
-
-                        if (authResult == null) {
-                            if (lastErr is HttpException && lastErr.code() == 404) {
-                                isLoading = false
-                                showWebOAuth = true
-                                return@launch
-                            }
-                            throw lastErr ?: IllegalStateException("Nepodařilo se získat token")
-                        }
-
-                        val siteUrl = MydlinkClient.normalizeSiteUrl(authResult.api_site)
-                        val mapped = MydlinkClient.loadCamerasWithToken(authResult.access_token, siteUrl)
-                        onLoginSuccess(authResult.access_token, siteUrl, mapped)
-                    } catch (e: Exception) {
-                        errorMessage = "API vrátilo chybu (${e.localizedMessage}). Použijte tlačítko OAuth2 nahoře."
-                    } finally {
-                        isLoading = false
-                    }
-                }
-            },
-            enabled = !isLoading && email.isNotBlank() && password.isNotBlank(),
-            modifier = Modifier.fillMaxWidth().height(46.dp),
-            shape = RoundedCornerShape(14.dp)
-        ) {
-            Text("Přihlásit se heslem")
-        }
-
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(12.dp))
 
         OutlinedButton(
-            onClick = {
-                onLoginSuccess(
-                    "demo_local_token",
-                    MydlinkClient.DEFAULT_EU_SITE,
-                    LoadCamerasResult(defaultUserCameras(), "Demo režim", false)
-                )
-            },
-            modifier = Modifier.fillMaxWidth().height(46.dp),
+            onClick = { showWebOAuth = true },
+            enabled = !isLoading,
+            modifier = Modifier.fillMaxWidth().height(48.dp),
             shape = RoundedCornerShape(14.dp)
         ) {
-            Text("Spustit v offline Demo režimu (4 kamery)")
+            if (isLoading) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            } else {
+                Text("Ověřit e-mail a heslo přes mydlink", fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        TextButton(
+            onClick = {
+                onLoginSuccess("demo_local_token", MydlinkClient.DEFAULT_EU_API_SITE, defaultUserCameras(), "Offline Demo režim")
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Spustit v offline Demo režimu (4 kamery)", color = Color(0xFF9CA3AF))
         }
     }
 }
@@ -1038,27 +901,46 @@ fun LoginScreen(
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun MydlinkWebOAuthDialog(
-    onDismiss: () -> Unit,
-    onTokenCaptured: (String, String?, String?) -> Unit
+    onTokenReceived: (String, String?, List<CameraUiState>) -> Unit,
+    onDismiss: () -> Unit
 ) {
-    val alreadyCaptured = remember { AtomicBoolean(false) }
-    var statusHint by remember { mutableStateOf("Přihlaste se prosím níže svým e-mailem a heslem...") }
-
-    AlertDialog(
+    Dialog(
         onDismissRequest = onDismiss,
-        title = {
-            Column {
-                Text("Přihlášení k mydlink účtu", fontSize = 16.sp)
-                Text(statusHint, fontSize = 11.sp, color = Color(0xFF34D399))
-            }
-        },
-        text = {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(480.dp)
-                    .clip(RoundedCornerShape(12.dp))
-            ) {
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.95f)
+                .fillMaxHeight(0.88f)
+                .clip(RoundedCornerShape(20.dp)),
+            color = Color(0xFF1E2025)
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Přihlášení k mydlink účtu",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp,
+                            color = Color.White
+                        )
+                        Text(
+                            "Po přihlášení se kamery automaticky přenesou do aplikace",
+                            fontSize = 11.sp,
+                            color = Color(0xFF34D399)
+                        )
+                    }
+                    TextButton(onClick = onDismiss) {
+                        Text("Zrušit", color = Color(0xFF34D399))
+                    }
+                }
+
                 AndroidView(
                     factory = { ctx ->
                         WebView(ctx).apply {
@@ -1066,127 +948,131 @@ fun MydlinkWebOAuthDialog(
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
+                            settings.databaseEnabled = true
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
                             settings.userAgentString = MydlinkClient.DESKTOP_USER_AGENT
+                            var completed = false
 
                             addJavascriptInterface(object {
                                 @JavascriptInterface
-                                fun onUserSessionCaptured(
-                                    token: String?,
-                                    siteOrUrl: String?,
-                                    devicesJson: String?
+                                fun onSessionCaptured(
+                                    token: String,
+                                    siteUrl: String?,
+                                    rawDeviceJson: String?
                                 ) {
-                                    if (!token.isNullOrBlank() &&
-                                        token.length >= 10 &&
-                                        alreadyCaptured.compareAndSet(false, true)
-                                    ) {
+                                    if (!completed && token.isNotBlank()) {
+                                        completed = true
+                                        CookieManager.getInstance().flush()
+                                        val parsedCameras = if (!rawDeviceJson.isNullOrBlank()) {
+                                            MydlinkClient.parseDevicesFromJson(rawDeviceJson)
+                                        } else {
+                                            emptyList()
+                                        }
                                         post {
-                                            statusHint = "Účet ověřen! Přepínám na kamery..."
-                                            onTokenCaptured(token, siteOrUrl, devicesJson)
+                                            onTokenReceived(token, siteUrl, parsedCameras)
                                         }
                                     }
                                 }
                             }, "AndroidOAuthBridge")
 
                             webViewClient = object : WebViewClient() {
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): Boolean {
+                                    val url = request?.url?.toString() ?: return false
+                                    if (url.contains("access_token=")) {
+                                        val token = url.substringAfter("access_token=").substringBefore("&")
+                                        if (token.isNotBlank() && !completed) {
+                                            completed = true
+                                            CookieManager.getInstance().flush()
+                                            onTokenReceived(token, MydlinkClient.DEFAULT_EU_API_SITE, emptyList())
+                                            return true
+                                        }
+                                    }
+                                    return false
+                                }
+
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     super.onPageFinished(view, url)
-                                    val hookScript = """
+                                    val interceptorJs = """
                                         (function() {
-                                            if (window.__mydlinkUserHooked) return;
-                                            window.__mydlinkUserHooked = true;
+                                            if (window.__mydlinkHooked) return;
+                                            window.__mydlinkHooked = true;
                                             window.__lastUserToken = null;
                                             window.__lastApiSite = null;
+                                            window.__lastDeviceJson = null;
 
-                                            function findStoredToken() {
+                                            function handleAuthJson(txt, srcUrl) {
                                                 try {
-                                                    var stores = [window.localStorage, window.sessionStorage];
-                                                    for (var s = 0; s < stores.length; s++) {
-                                                        var st = stores[s];
-                                                        if (!st) continue;
-                                                        for (var i = 0; i < st.length; i++) {
-                                                            var k = st.key(i) || '';
-                                                            var v = st.getItem(k) || '';
-                                                            if (k.toLowerCase().indexOf('token') !== -1 && v.length > 20) {
-                                                                try {
-                                                                    var parsed = JSON.parse(v);
-                                                                    if (parsed && parsed.access_token) return parsed.access_token;
-                                                                } catch(e) {
-                                                                    if (v.indexOf('{') === -1) return v.replace(/"/g, '');
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                } catch(e) {}
-                                                return null;
-                                            }
-
-                                            function scrapeCamerasFromDom() {
-                                                var bodyTxt = document.body ? (document.body.innerText || '') : '';
-                                                if (bodyTxt.indexOf('Watch Live') === -1 && bodyTxt.indexOf('Click to watch live') === -1) {
-                                                    return null;
-                                                }
-                                                var found = [];
-                                                var seenNames = {};
-                                                var allEls = document.querySelectorAll('div, section, article, li');
-                                                for (var i = 0; i < allEls.length; i++) {
-                                                    var el = allEls[i];
-                                                    var txt = (el.innerText || '').trim();
-                                                    if (txt.indexOf('Watch Live') !== -1 && txt.length < 300) {
-                                                        var lines = txt.split('\n').map(function(l) { return l.trim(); }).filter(function(l) {
-                                                            return l.length > 1 &&
-                                                                l.indexOf('Watch Live') === -1 &&
-                                                                l.indexOf('Click to watch') === -1 &&
-                                                                l.indexOf('Cameras') === -1 &&
-                                                                l.indexOf('My Home') === -1 &&
-                                                                !/^\d{4}\/\d{2}\/\d{2}/.test(l);
-                                                        });
-                                                        if (lines.length > 0) {
-                                                            var camName = lines[0];
-                                                            var modelMatch = txt.match(/DCS-[A-Z0-9-]+/i);
-                                                            var model = modelMatch ? modelMatch[0].toUpperCase() : 'DCS-6500LH';
-                                                            if (!seenNames[camName]) {
-                                                                seenNames[camName] = true;
-                                                                found.push({
-                                                                    mydlink_id: 'portal_cam_' + found.length,
-                                                                    device_name: camName,
-                                                                    model: model,
-                                                                    online: true
-                                                                });
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                return found.length > 0 ? JSON.stringify({ data: found }) : null;
-                                            }
-
-                                            function handleAuthJson(text, reqUrl) {
-                                                try {
-                                                    var data = JSON.parse(text);
+                                                    var data = JSON.parse(txt);
                                                     if (data && data.access_token && data.refresh_token) {
                                                         window.__lastUserToken = data.access_token;
-                                                        window.__lastApiSite = data.api_site || reqUrl;
-                                                    }
-                                                } catch(e) {}
-                                            }
-
-                                            function handleDeviceListJson(text, reqUrl, authHeader) {
-                                                try {
-                                                    var data = JSON.parse(text);
-                                                    var list = data && (data.data || data.devices || (data.data && data.data.devices));
-                                                    if (Array.isArray(list) && list.length > 0) {
-                                                        var tok = window.__lastUserToken
-                                                            || (authHeader && authHeader.replace(/^Bearer\s+/i, '').trim())
-                                                            || findStoredToken()
-                                                            || 'web_session_token';
-                                                        AndroidOAuthBridge.onUserSessionCaptured(
-                                                            tok,
-                                                            window.__lastApiSite || reqUrl,
-                                                            text
+                                                        window.__lastApiSite = data.api_site || srcUrl;
+                                                        AndroidOAuthBridge.onSessionCaptured(
+                                                            data.access_token,
+                                                            window.__lastApiSite,
+                                                            window.__lastDeviceJson
                                                         );
                                                     }
                                                 } catch(e) {}
+                                            }
+
+                                            function handleDeviceListJson(txt, srcUrl, authHeader) {
+                                                try {
+                                                    var data = JSON.parse(txt);
+                                                    if (data && (Array.isArray(data.data) || (data.data && Array.isArray(data.data.device_list)))) {
+                                                        window.__lastDeviceJson = txt;
+                                                        var tok = window.__lastUserToken;
+                                                        if (!tok && authHeader && authHeader.toLowerCase().indexOf('bearer ') === 0) {
+                                                            tok = authHeader.substring(7).trim();
+                                                        }
+                                                        AndroidOAuthBridge.onSessionCaptured(
+                                                            tok || 'web_session_active',
+                                                            srcUrl,
+                                                            txt
+                                                        );
+                                                    }
+                                                } catch(e) {}
+                                            }
+
+                                            function extractCamerasFromDom() {
+                                                var found = [];
+                                                var seen = {};
+                                                var allText = document.body ? (document.body.innerText || '') : '';
+                                                if (allText.indexOf('Watch Live') === -1 && allText.indexOf('Click to watch') === -1) {
+                                                    return null;
+                                                }
+                                                var blocks = document.querySelectorAll('div, section, article, li');
+                                                for (var i = 0; i < blocks.length; i++) {
+                                                    var el = blocks[i];
+                                                    var txt = (el.innerText || '').trim();
+                                                    if (txt.indexOf('Watch Live') !== -1 && txt.length < 220) {
+                                                        var lines = txt.split('\n').map(function(l) { return l.trim(); }).filter(function(l) {
+                                                            return l.length > 0 &&
+                                                                l.indexOf('Watch Live') === -1 &&
+                                                                l.indexOf('Click to watch') === -1 &&
+                                                                !(/^\d{4}\/\d{2}\/\d{2}/.test(l));
+                                                        });
+                                                        var camName = lines.length > 0 ? lines[0] : '';
+                                                        var modelMatch = txt.match(/DCS-[A-Z0-9]+/i);
+                                                        var modelName = modelMatch ? modelMatch[0].toUpperCase() : 'DCS-6500LH';
+                                                        if (camName && camName.length < 40 && !seen[camName]) {
+                                                            seen[camName] = true;
+                                                            found.push({
+                                                                mydlink_id: 'dom_cam_' + found.length + '_' + camName,
+                                                                device_name: camName,
+                                                                model: modelName,
+                                                                online: true
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                                if (found.length > 0) {
+                                                    return JSON.stringify({ data: found });
+                                                }
+                                                return null;
                                             }
 
                                             var origFetch = window.fetch;
@@ -1205,6 +1091,10 @@ fun MydlinkWebOAuthDialog(
                                                         if (u && u.indexOf('mydlink.com') !== -1) {
                                                             resp.clone().text().then(function(txt) {
                                                                 handleAuthJson(txt, u);
+                                                                if (auth && auth.toLowerCase().indexOf('bearer ') === 0 && u.indexOf('/me/') !== -1) {
+                                                                    window.__lastUserToken = auth.substring(7).trim();
+                                                                    window.__lastApiSite = u;
+                                                                }
                                                                 if (u.indexOf('/device/list') !== -1) {
                                                                     handleDeviceListJson(txt, u, auth);
                                                                 }
@@ -1215,21 +1105,58 @@ fun MydlinkWebOAuthDialog(
                                                 });
                                             };
 
-                                            // Kontrola DOM po přihlášení (okamžité zachycení kamer z portálu)
+                                            var origOpen = XMLHttpRequest.prototype.open;
+                                            var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+                                            var origSend = XMLHttpRequest.prototype.send;
+
+                                            XMLHttpRequest.prototype.open = function(method, reqUrl) {
+                                                this.__reqUrl = reqUrl ? reqUrl.toString() : '';
+                                                this.__reqHeaders = {};
+                                                return origOpen.apply(this, arguments);
+                                            };
+
+                                            XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+                                                if (this.__reqHeaders && header) {
+                                                    this.__reqHeaders[header.toLowerCase()] = value;
+                                                }
+                                                return origSetHeader.apply(this, arguments);
+                                            };
+
+                                            XMLHttpRequest.prototype.send = function() {
+                                                var self = this;
+                                                this.addEventListener('load', function() {
+                                                    try {
+                                                        var u = self.__reqUrl || '';
+                                                        var auth = self.__reqHeaders ? self.__reqHeaders['authorization'] : null;
+                                                        var txt = self.responseText || '';
+                                                        if (u.indexOf('mydlink.com') !== -1) {
+                                                            handleAuthJson(txt, u);
+                                                            if (auth && auth.toLowerCase().indexOf('bearer ') === 0 && u.indexOf('/me/') !== -1) {
+                                                                window.__lastUserToken = auth.substring(7).trim();
+                                                                window.__lastApiSite = u;
+                                                            }
+                                                            if (u.indexOf('/device/list') !== -1) {
+                                                                handleDeviceListJson(txt, u, auth);
+                                                            }
+                                                        }
+                                                    } catch(e) {}
+                                                });
+                                                return origSend.apply(this, arguments);
+                                            };
+
                                             setInterval(function() {
-                                                var scraped = scrapeCamerasFromDom();
-                                                if (scraped) {
-                                                    var tok = window.__lastUserToken || findStoredToken() || 'web_session_token';
-                                                    AndroidOAuthBridge.onUserSessionCaptured(
-                                                        tok,
+                                                var domJson = extractCamerasFromDom();
+                                                if (domJson) {
+                                                    AndroidOAuthBridge.onSessionCaptured(
+                                                        window.__lastUserToken || 'web_session_active',
                                                         window.__lastApiSite || 'https://mp-eu-openapi.auto.mydlink.com',
-                                                        scraped
+                                                        window.__lastDeviceJson || domJson
                                                     );
                                                 }
                                             }, 1000);
                                         })();
                                     """.trimIndent()
-                                    view?.evaluateJavascript(hookScript, null)
+                                    view?.evaluateJavascript(interceptorJs, null)
                                 }
                             }
                             loadUrl(MydlinkClient.MYDLINK_WEB_PORTAL_URL)
@@ -1238,16 +1165,9 @@ fun MydlinkWebOAuthDialog(
                     modifier = Modifier.fillMaxSize()
                 )
             }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Zrušit") }
         }
-    )
+    }
 }
-
-// ============================================================================
-// 6. HLAVNÍ DASHBOARD S MŘÍŽKOU 1x1, 2x1 A 2x2
-// ============================================================================
 
 @Composable
 fun DashboardScreen(
@@ -1256,12 +1176,12 @@ fun DashboardScreen(
     selectedSingleId: String,
     keepAwake: Boolean,
     keepAliveSeconds: Int,
-    isRefreshingStreams: Boolean,
+    isRefreshing: Boolean,
     onGridModeChange: (GridMode) -> Unit,
     onSelectSingleCamera: (String) -> Unit,
-    onToggleKeepAwake: () -> Unit,
     onRefreshStreams: () -> Unit,
-    onShowDiagnostics: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
+    onToggleKeepAwake: () -> Unit,
     onToggleMute: (String) -> Unit,
     onPtzMove: (String, String) -> Unit,
     onToggleSpotlight: (String) -> Unit,
@@ -1281,21 +1201,29 @@ fun DashboardScreen(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Moje Kamery", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                Text("Moje Kamery", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color.White)
                 Text(
-                    if (isRefreshingStreams) "Načítám streamy..." else "Ping za ${keepAliveSeconds}s",
+                    "Ping za ${keepAliveSeconds}s",
                     fontSize = 11.sp,
                     color = Color(0xFF34D399)
                 )
             }
 
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                IconButton(onClick = onRefreshStreams) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Obnovit obraz", tint = Color(0xFF34D399))
+                IconButton(onClick = onRefreshStreams, enabled = !isRefreshing) {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "Obnovit streamy",
+                        tint = if (isRefreshing) Color.Gray else Color(0xFF34D399)
+                    )
                 }
 
-                IconButton(onClick = onShowDiagnostics) {
-                    Icon(Icons.Default.BugReport, contentDescription = "Diagnostika", tint = Color(0xFF9CA3AF))
+                IconButton(onClick = onOpenDiagnostics) {
+                    Icon(
+                        Icons.Default.BugReport,
+                        contentDescription = "Diagnostika",
+                        tint = Color(0xFF9CA3AF)
+                    )
                 }
 
                 IconButton(onClick = onOpenNotifications) {
@@ -1305,7 +1233,7 @@ fun DashboardScreen(
                 FilterChip(
                     selected = keepAwake,
                     onClick = onToggleKeepAwake,
-                    label = { Text("Zapnuto", fontSize = 11.sp) },
+                    label = { Text("Zapnuto", fontSize = 10.sp) },
                     leadingIcon = {
                         Icon(Icons.Default.Visibility, contentDescription = null, modifier = Modifier.size(14.dp))
                     }
@@ -1377,8 +1305,10 @@ fun DashboardScreen(
             contentPadding = PaddingValues(bottom = 12.dp)
         ) {
             items(visibleCameras, key = { it.id }) { camera ->
+                val tileIndex = visibleCameras.indexOf(camera).coerceAtLeast(0)
                 CameraTileCard(
                     camera = camera,
+                    tileIndex = tileIndex,
                     onRefreshStream = onRefreshStreams,
                     onToggleMute = { onToggleMute(camera.id) },
                     onPtzMove = { dir -> onPtzMove(camera.id, dir) },
@@ -1395,6 +1325,7 @@ fun DashboardScreen(
 @Composable
 fun CameraTileCard(
     camera: CameraUiState,
+    tileIndex: Int = 0,
     onRefreshStream: () -> Unit,
     onToggleMute: () -> Unit,
     onPtzMove: (String) -> Unit,
@@ -1434,7 +1365,7 @@ fun CameraTileCard(
                 .background(Color.Black)
                 .clickable { onOpenFullscreen() }
         ) {
-            CameraVideoSurface(camera = camera, onRefreshStream = onRefreshStream)
+            CameraVideoSurface(camera = camera, tileIndex = tileIndex, onRefreshStream = onRefreshStream)
 
             Row(
                 modifier = Modifier
@@ -1568,15 +1499,24 @@ fun PtzDpadControl(onMove: (String) -> Unit, large: Boolean = false) {
     }
 }
 
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun CameraVideoSurface(
     camera: CameraUiState,
+    tileIndex: Int = 0,
     onRefreshStream: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("mydlink_prefs", Context.MODE_PRIVATE) }
     val token = remember { prefs.getString("access_token", null) }
     var webVideoPlaying by remember(camera.id) { mutableStateOf(false) }
+
+    LaunchedEffect(camera.id, webVideoPlaying) {
+        if (!webVideoPlaying && camera.streamUrl == null && token != null && token != "demo_local_token") {
+            delay(9000L)
+            webVideoPlaying = true
+        }
+    }
 
     if (camera.privacyMode) {
         Box(modifier = Modifier.fillMaxSize().background(Color(0xFF090A0D)), contentAlignment = Alignment.Center) {
@@ -1630,9 +1570,16 @@ fun CameraVideoSurface(
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        settings.databaseEnabled = true
+                        settings.useWideViewPort = true
+                        settings.loadWithOverviewMode = true
                         settings.mediaPlaybackRequiresUserGesture = false
                         settings.userAgentString = MydlinkClient.DESKTOP_USER_AGENT
-                        webChromeClient = WebChromeClient()
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onPermissionRequest(request: PermissionRequest?) {
+                                request?.grant(request.resources)
+                            }
+                        }
 
                         addJavascriptInterface(object {
                             @JavascriptInterface
@@ -1645,14 +1592,42 @@ fun CameraVideoSurface(
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
                                 val safeName = JSONObject.quote(camera.name)
-                                val safeId = JSONObject.quote(camera.id)
                                 val playerHook = """
                                     (function() {
                                         var targetName = $safeName;
-                                        var targetId = $safeId;
+                                        var fallbackIdx = $tileIndex;
                                         var clickedWatchLive = false;
+                                        var ticks = 0;
 
-                                        function isolateVideo() {
+                                        function findBestCard() {
+                                            var best = null;
+                                            var bestLen = 999999;
+                                            var allCards = [];
+                                            var blocks = document.querySelectorAll('div, section, article, li');
+                                            for (var i = 0; i < blocks.length; i++) {
+                                                var el = blocks[i];
+                                                var txt = (el.innerText || '');
+                                                var hasLiveTrigger = (txt.indexOf('Watch Live') !== -1 || txt.indexOf('Click to watch') !== -1 || el.querySelector('video, canvas'));
+                                                if (hasLiveTrigger && txt.length < 350) {
+                                                    allCards.push(el);
+                                                    if (txt.toLowerCase().indexOf(targetName.toLowerCase()) !== -1 && txt.length < bestLen) {
+                                                        best = el;
+                                                        bestLen = txt.length;
+                                                    }
+                                                }
+                                            }
+                                            if (!best && ticks > 3 && allCards.length > fallbackIdx) {
+                                                best = allCards[fallbackIdx];
+                                            }
+                                            return best;
+                                        }
+
+                                        function pinElementFullscreen(el) {
+                                            el.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;object-fit:cover !important;z-index:2147483647 !important;background:#000 !important;';
+                                            AndroidStreamBridge.onVideoFramesReady();
+                                        }
+
+                                        function isolateVideoOrCanvas() {
                                             var videos = document.querySelectorAll('video');
                                             for (var i = 0; i < videos.length; i++) {
                                                 var v = videos[i];
@@ -1661,51 +1636,59 @@ fun CameraVideoSurface(
                                                 v.playsInline = true;
                                                 if (v.paused) { v.play().catch(function(){}); }
                                                 if (v.readyState >= 2 && v.videoWidth > 0) {
-                                                    v.style.cssText = 'position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;object-fit:cover !important;z-index:999999 !important;background:#000 !important;';
-                                                    AndroidStreamBridge.onVideoFramesReady();
+                                                    pinElementFullscreen(v);
                                                     return true;
+                                                }
+                                            }
+                                            if (clickedWatchLive) {
+                                                var canvases = document.querySelectorAll('canvas');
+                                                for (var c = 0; c < canvases.length; c++) {
+                                                    var cv = canvases[c];
+                                                    if (cv.width >= 160 && cv.height >= 90) {
+                                                        pinElementFullscreen(cv);
+                                                        return true;
+                                                    }
                                                 }
                                             }
                                             return false;
                                         }
 
                                         setInterval(function() {
-                                            if (isolateVideo()) return;
-                                            if (!clickedWatchLive) {
-                                                var blocks = document.querySelectorAll('div, section, article');
-                                                for (var j = 0; j < blocks.length; j++) {
-                                                    var box = blocks[j];
-                                                    var txt = (box.innerText || '');
-                                                    if (txt.indexOf(targetName) !== -1 && txt.indexOf('Watch Live') !== -1 && txt.length < 350) {
-                                                        var btns = box.querySelectorAll('button, span, div, a');
-                                                        for (var k = 0; k < btns.length; k++) {
-                                                            var bTxt = (btns[k].innerText || '').trim();
-                                                            if (bTxt.indexOf('Watch Live') !== -1 || bTxt.indexOf('Click to watch') !== -1) {
-                                                                btns[k].click();
-                                                                clickedWatchLive = true;
-                                                                break;
-                                                            }
-                                                        }
-                                                        if (!clickedWatchLive) {
-                                                            box.click();
-                                                            clickedWatchLive = true;
-                                                        }
+                                            ticks++;
+                                            if (isolateVideoOrCanvas()) return;
+                                            var card = findBestCard();
+                                            if (card && !clickedWatchLive) {
+                                                try { card.scrollIntoView({block: 'center'}); } catch(e) {}
+                                                var btns = card.querySelectorAll('button, span, div, a, img');
+                                                for (var k = 0; k < btns.length; k++) {
+                                                    var bTxt = (btns[k].innerText || '').trim();
+                                                    if (bTxt === 'Watch Live' || bTxt.indexOf('Watch Live') !== -1 || bTxt.indexOf('Click to watch') !== -1) {
+                                                        btns[k].click();
+                                                        btns[k].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                                        clickedWatchLive = true;
                                                         break;
                                                     }
                                                 }
+                                                if (!clickedWatchLive) {
+                                                    card.click();
+                                                    card.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                                    clickedWatchLive = true;
+                                                }
                                             }
-                                        }, 1000);
+                                        }, 850);
                                     })();
                                 """.trimIndent()
                                 view?.evaluateJavascript(playerHook, null)
                             }
                         }
-                        loadUrl(MydlinkClient.MYDLINK_WEB_PORTAL_URL)
+                        postDelayed({
+                            loadUrl(MydlinkClient.MYDLINK_WEB_PORTAL_URL)
+                        }, (tileIndex * 450L))
                     }
                 },
                 update = { webView ->
                     webView.evaluateJavascript(
-                        "document.querySelectorAll('video').forEach(v => v.muted = ${camera.muted});",
+                        "document.querySelectorAll('video').forEach(function(v){ v.muted = ${camera.muted}; if (v.paused) { v.play().catch(function(){}); } });",
                         null
                     )
                 },
@@ -1716,11 +1699,13 @@ fun CameraVideoSurface(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Brush.verticalGradient(listOf(Color(0xFF1F2937), Color(0xFF111827))))
-                        .padding(8.dp),
+                        .background(Brush.verticalGradient(listOf(Color(0xFF1F2937), Color(0xFF111827)))),
                     contentAlignment = Alignment.Center
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(8.dp)
+                    ) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(22.dp),
                             strokeWidth = 2.dp,
@@ -1733,13 +1718,15 @@ fun CameraVideoSurface(
                             color = Color(0xFFD1D5DB),
                             textAlign = TextAlign.Center
                         )
-                        Spacer(Modifier.height(4.dp))
+                        Spacer(Modifier.height(6.dp))
                         OutlinedButton(
                             onClick = onRefreshStream,
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                            modifier = Modifier.height(24.dp)
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                            modifier = Modifier.height(26.dp)
                         ) {
-                            Text("Obnovit", fontSize = 9.sp)
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(12.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Obnovit", fontSize = 10.sp)
                         }
                     }
                 }
@@ -1749,23 +1736,27 @@ fun CameraVideoSurface(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.verticalGradient(listOf(Color(0xFF1F2937), Color(0xFF111827))))
-                .padding(8.dp),
+                .background(Brush.verticalGradient(listOf(Color(0xFF1F2937), Color(0xFF111827)))),
             contentAlignment = Alignment.Center
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(8.dp)
+            ) {
                 Icon(Icons.Default.Videocam, null, tint = Color(0xFF34D399), modifier = Modifier.size(26.dp))
                 Spacer(Modifier.height(4.dp))
-                Text(camera.model, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFD1D5DB))
-                Text("Demo režim (offline)", fontSize = 9.sp, color = Color(0xFF9CA3AF))
+                Text(
+                    "${camera.name} (${camera.model})",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color(0xFFD1D5DB),
+                    textAlign = TextAlign.Center
+                )
+                Text("Demo / Offline režim", fontSize = 9.sp, color = Color(0xFF9CA3AF))
             }
         }
     }
 }
-
-// ============================================================================
-// 7. CELÁ OBRAZOVKA (FULL-SCREEN) PRO VYBRANOU KAMERU
-// ============================================================================
 
 @Composable
 fun FullscreenCameraOverlay(
@@ -1888,10 +1879,6 @@ fun FullscreenCameraOverlay(
         }
     }
 }
-
-// ============================================================================
-// 8. NASTAVENÍ KAMERY A PŘEHLED NOTIFIKACÍ
-// ============================================================================
 
 @Composable
 fun CameraSettingsDialog(
