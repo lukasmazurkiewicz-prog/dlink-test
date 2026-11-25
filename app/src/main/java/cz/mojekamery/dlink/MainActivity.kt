@@ -15,8 +15,6 @@ import android.os.Bundle
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
@@ -239,6 +237,14 @@ object MydlinkClient {
             "https://$host"
         } catch (_: Exception) {
             DEFAULT_EU_SITE
+        }
+    }
+
+    fun md5(input: String): String {
+        val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray())
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
     suspend fun loadCamerasWithToken(
         token: String,
         siteUrl: String,
@@ -360,7 +366,7 @@ object MydlinkClient {
                         } else {
                             streamNote = "WebRTC Cloud tunel"
                         }
-                    } catch (e: Exception) {
+                    } catch (_: Exception) {
                         streamNote = "WebRTC Cloud tunel"
                     }
                 }
@@ -1100,8 +1106,7 @@ fun MydlinkWebOAuthDialog(
                                             function handleAuthJson(text, reqUrl) {
                                                 try {
                                                     var data = JSON.parse(text);
-                                                    // Ignorujeme anonymní client_credentials token (nemá refresh_token)!
-                                                    // Skutečné přihlášení uživatele VŽDY obsahuje refresh_token.
+                                                    // Ignorujeme anonymní client_credentials token (nemá refresh_token)
                                                     if (data && data.access_token && data.refresh_token) {
                                                         window.__lastUserToken = data.access_token;
                                                         window.__lastApiSite = data.api_site || reqUrl;
@@ -1573,7 +1578,6 @@ fun CameraVideoSurface(
             modifier = Modifier.fillMaxSize()
         )
     } else if (token != null && token != "demo_local_token") {
-        // WebRTC Cloud přehrávač: spustí přenos z přihlášené relace mydlink a izoluje čistý prvek <video>
         Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0D1117))) {
             AndroidView(
                 factory = { ctx ->
@@ -1654,7 +1658,6 @@ fun CameraVideoSurface(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Dokud nenaběhnou skutečné snímky videa, zakryjeme WebView čistou nativní obrazovkou
             if (!webVideoPlaying) {
                 Box(
                     modifier = Modifier
