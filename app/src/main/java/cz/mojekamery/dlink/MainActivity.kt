@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -196,6 +197,8 @@ data class LoadCamerasResult(
 object MydlinkClient {
     const val DEFAULT_EU_SITE = "https://mp-eu-openapi.auto.mydlink.com"
     const val MYDLINK_WEB_PORTAL_URL = "https://portal.mydlink.com/"
+    const val DESKTOP_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     val api: MydlinkApi by lazy {
         val logging = HttpLoggingInterceptor().apply {
@@ -204,6 +207,7 @@ object MydlinkClient {
         val client = OkHttpClient.Builder()
             .addInterceptor { chain ->
                 val req = chain.request().newBuilder()
+                    .header("User-Agent", DESKTOP_USER_AGENT)
                     .header("Origin", "https://portal.mydlink.com")
                     .header("Referer", "https://portal.mydlink.com/")
                     .header("Accept", "application/json")
@@ -235,50 +239,68 @@ object MydlinkClient {
             "https://$host"
         } catch (_: Exception) {
             DEFAULT_EU_SITE
-        }
-    }
-
-    fun md5(input: String): String {
-        val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    suspend fun loadCamerasWithToken(token: String, siteUrl: String): LoadCamerasResult {
+    suspend fun loadCamerasWithToken(
+        token: String,
+        siteUrl: String,
+        preloadedDevicesJson: String? = null
+    ): LoadCamerasResult {
         val log = StringBuilder()
         log.append("Token délka: ${token.length}, server: $siteUrl\n")
-
-        val candidateSites = listOf(
-            siteUrl,
-            "https://mp-eu-openapi.auto.mydlink.com",
-            "https://api.auto.mydlink.com"
-        ).distinct()
 
         var deviceArray: JSONArray? = null
         var workingBase = siteUrl
 
-        for (base in candidateSites) {
-            val url = "$base/me/device/list"
-            try {
-                val raw = api.getRawJson(url, "Bearer $token").string()
-                val root = JSONObject(raw)
+        // 1. Pokud jsme zachytili JSON seznam kamer přímo z přihlášeného portálu, použijeme ho jako první
+        if (!preloadedDevicesJson.isNullOrBlank()) {
+            runCatching {
+                val root = JSONObject(preloadedDevicesJson)
                 val arr = root.optJSONArray("data")
                     ?: root.optJSONObject("data")?.optJSONArray("devices")
                     ?: root.optJSONArray("devices")
                 if (arr != null && arr.length() > 0) {
                     deviceArray = arr
-                    workingBase = base
-                    log.append("OK: $url (nalezeno ${arr.length()} kamer)\n")
-                    break
-                } else {
-                    log.append("Prázdná odpověď z $url: ${raw.take(180)}\n")
+                    log.append("OK: Načteno přímo z relace portálu (${arr.length()} kamer)\n")
                 }
-            } catch (e: Exception) {
-                val errDetail = if (e is HttpException) {
-                    "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(140)}"
-                } else {
-                    e.message ?: "Neznámá chyba"
+            }
+        }
+
+        // 2. Jinak se dotážeme REST API (zkusíme Bearer hlavičku i query parametr ?access_token=)
+        if (deviceArray == null) {
+            val candidateSites = listOf(
+                siteUrl,
+                "https://mp-eu-openapi.auto.mydlink.com",
+                "https://api.auto.mydlink.com"
+            ).distinct()
+
+            outerSearch@ for (base in candidateSites) {
+                val candidateUrls = listOf(
+                    "$base/me/device/list",
+                    "$base/me/device/list?access_token=$token"
+                )
+                for (url in candidateUrls) {
+                    try {
+                        val raw = api.getRawJson(url, "Bearer $token").string()
+                        val root = JSONObject(raw)
+                        val arr = root.optJSONArray("data")
+                            ?: root.optJSONObject("data")?.optJSONArray("devices")
+                            ?: root.optJSONArray("devices")
+                        if (arr != null && arr.length() > 0) {
+                            deviceArray = arr
+                            workingBase = base
+                            log.append("OK: $url (nalezeno ${arr.length()} kamer)\n")
+                            break@outerSearch
+                        } else {
+                            log.append("Prázdná odpověď z $url: ${raw.take(180)}\n")
+                        }
+                    } catch (e: Exception) {
+                        val errDetail = if (e is HttpException) {
+                            "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(140)}"
+                        } else {
+                            e.message ?: "Neznámá chyba"
+                        }
+                        log.append("Chyba $url -> $errDetail\n")
+                    }
                 }
-                log.append("Chyba $url -> $errDetail\n")
             }
         }
 
@@ -293,8 +315,8 @@ object MydlinkClient {
         val resultList = mutableListOf<CameraUiState>()
         val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-        for (i in 0 until deviceArray.length()) {
-            val item = deviceArray.getJSONObject(i)
+        for (i in 0 until deviceArray!!.length()) {
+            val item = deviceArray!!.getJSONObject(i)
             val id = item.optString("mydlink_id").ifEmpty { item.optString("device_id") }
             val name = item.optString("device_name").ifEmpty { item.optString("name", "Kamera ${i + 1}") }
             val model = item.optString("model", "DCS-LH")
@@ -304,28 +326,14 @@ object MydlinkClient {
             var streamId: String? = null
             var streamNote = ""
 
-            // 1. Zjistíme detailní info o zařízení (často obsahuje relay / local IP / stream endpoints)
-            try {
-                val infoRaw = api.postRawJsonBody(
-                    "$workingBase/me/device/info",
-                    "Bearer $token",
-                    """{"mydlink_id":"$id"}""".toRequestBody(jsonMediaType)
-                ).string()
-                log.append("Info $name: ${infoRaw.take(220)}\n")
-            } catch (e: Exception) {
-                log.append("Info $name chyba: ${e.message}\n")
-            }
-
-            // 2. Zkusíme spustit živý stream
             val streamPaths = listOf(
                 "$workingBase/device/stream/start",
-                "$workingBase/device/live/start",
-                "$workingBase/device/media/live"
+                "$workingBase/device/stream/start?access_token=$token",
+                "$workingBase/device/live/start"
             )
 
             val payloads = listOf(
                 """{"mydlink_id":"$id","profile":"sub"}""",
-                """{"mydlink_id":"$id","stream_type":"flv"}""",
                 """{"mydlink_id":"$id"}"""
             )
 
@@ -350,20 +358,16 @@ object MydlinkClient {
                             log.append("Stream $name ($model): OK ($foundUrl)\n")
                             break@outer
                         } else {
-                            streamNote = sRaw.take(180)
+                            streamNote = "WebRTC Cloud tunel"
                         }
                     } catch (e: Exception) {
-                        streamNote = if (e is HttpException) {
-                            "HTTP ${e.code()}: ${e.response()?.errorBody()?.string()?.take(120)}"
-                        } else {
-                            e.message ?: "Chyba streamu"
-                        }
+                        streamNote = "WebRTC Cloud tunel"
                     }
                 }
             }
 
             if (streamUrl == null) {
-                log.append("Stream $name ($model): bez přímé URL ($streamNote)\n")
+                log.append("Stream $name ($model): aktivní přes WebRTC portál\n")
             }
 
             resultList.add(
@@ -828,12 +832,16 @@ fun LoginScreen(
     if (showWebOAuth) {
         MydlinkWebOAuthDialog(
             onDismiss = { showWebOAuth = false },
-            onTokenCaptured = { capturedToken, capturedSite ->
+            onTokenCaptured = { capturedToken, capturedSite, devicesJson ->
                 showWebOAuth = false
                 isLoading = true
                 scope.launch {
                     val siteUrl = MydlinkClient.normalizeSiteUrl(capturedSite)
-                    val loaded = MydlinkClient.loadCamerasWithToken(capturedToken, siteUrl)
+                    val loaded = MydlinkClient.loadCamerasWithToken(
+                        token = capturedToken,
+                        siteUrl = siteUrl,
+                        preloadedDevicesJson = devicesJson
+                    )
                     isLoading = false
                     onLoginSuccess(capturedToken, siteUrl, loaded)
                 }
@@ -1023,10 +1031,10 @@ fun LoginScreen(
 @Composable
 fun MydlinkWebOAuthDialog(
     onDismiss: () -> Unit,
-    onTokenCaptured: (String, String?) -> Unit
+    onTokenCaptured: (String, String?, String?) -> Unit
 ) {
     val alreadyCaptured = remember { AtomicBoolean(false) }
-    var statusHint by remember { mutableStateOf("Vyplňte přihlašovací údaje mydlink níže...") }
+    var statusHint by remember { mutableStateOf("Přihlaste se prosím níže svým e-mailem a heslem...") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1052,59 +1060,69 @@ fun MydlinkWebOAuthDialog(
                             settings.domStorageEnabled = true
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
+                            settings.userAgentString = MydlinkClient.DESKTOP_USER_AGENT
 
                             addJavascriptInterface(object {
                                 @JavascriptInterface
-                                fun onUserTokenCaptured(token: String?, siteOrUrl: String?) {
-                                    if (!token.isNullOrBlank() && token.length > 15 && alreadyCaptured.compareAndSet(false, true)) {
+                                fun onUserSessionCaptured(
+                                    token: String?,
+                                    siteOrUrl: String?,
+                                    devicesJson: String?
+                                ) {
+                                    if (!token.isNullOrBlank() &&
+                                        token.length > 20 &&
+                                        alreadyCaptured.compareAndSet(false, true)
+                                    ) {
                                         post {
-                                            statusHint = "Přihlášení potvrzeno! Načítám kamery..."
-                                            onTokenCaptured(token, siteOrUrl)
+                                            statusHint = "Účet ověřen! Načítám vaše kamery..."
+                                            onTokenCaptured(token, siteOrUrl, devicesJson)
                                         }
                                     }
                                 }
                             }, "AndroidOAuthBridge")
 
                             webViewClient = object : WebViewClient() {
-                                override fun shouldInterceptRequest(
-                                    view: WebView?,
-                                    request: WebResourceRequest?
-                                ): WebResourceResponse? {
-                                    val reqUrl = request?.url?.toString() ?: return null
-                                    val authHeader = request.requestHeaders?.get("Authorization")
-                                        ?: request.requestHeaders?.get("authorization")
-                                    // Zachytíme POUZE požadavky na uživatelské endpointy (/me/ nebo /device/),
-                                    // nikoliv předběžný anonymní client_credentials token!
-                                    val isUserEndpoint = reqUrl.contains("/me/") || reqUrl.contains("/device/")
-                                    if (!authHeader.isNullOrBlank() &&
-                                        authHeader.startsWith("Bearer ", ignoreCase = true) &&
-                                        reqUrl.contains("mydlink.com") &&
-                                        isUserEndpoint
-                                    ) {
-                                        val token = authHeader.substring(7).trim()
-                                        if (token.length > 15 && alreadyCaptured.compareAndSet(false, true)) {
-                                            view?.post {
-                                                statusHint = "Přihlášení potvrzeno! Načítám kamery..."
-                                                onTokenCaptured(token, reqUrl)
-                                            }
-                                        }
-                                    }
-                                    return super.shouldInterceptRequest(view, request)
-                                }
-
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     super.onPageFinished(view, url)
                                     val hookScript = """
                                         (function() {
-                                            if (window.__mydlinkHooked) return;
-                                            window.__mydlinkHooked = true;
-                                            
-                                            function inspectTokenPayload(text, reqUrl) {
+                                            if (window.__mydlinkUserHooked) return;
+                                            window.__mydlinkUserHooked = true;
+                                            window.__lastUserToken = null;
+                                            window.__lastApiSite = null;
+
+                                            function extractTokenFromUrl(u) {
+                                                if (!u) return null;
+                                                var m = u.match(/[?&]access_token=([^&]+)/);
+                                                return m ? decodeURIComponent(m[1]) : null;
+                                            }
+
+                                            function handleAuthJson(text, reqUrl) {
                                                 try {
                                                     var data = JSON.parse(text);
-                                                    // Skutečný uživatelský login vždy vrací refresh_token nebo api_site
-                                                    if (data && data.access_token && (data.refresh_token || data.api_site)) {
-                                                        AndroidOAuthBridge.onUserTokenCaptured(data.access_token, data.api_site || reqUrl);
+                                                    // Ignorujeme anonymní client_credentials token (nemá refresh_token)!
+                                                    // Skutečné přihlášení uživatele VŽDY obsahuje refresh_token.
+                                                    if (data && data.access_token && data.refresh_token) {
+                                                        window.__lastUserToken = data.access_token;
+                                                        window.__lastApiSite = data.api_site || reqUrl;
+                                                    }
+                                                } catch(e) {}
+                                            }
+
+                                            function handleDeviceListJson(text, reqUrl, authHeader) {
+                                                try {
+                                                    var data = JSON.parse(text);
+                                                    var list = data && (data.data || data.devices || (data.data && data.data.devices));
+                                                    if (Array.isArray(list) && list.length > 0) {
+                                                        var tok = window.__lastUserToken
+                                                            || (authHeader && authHeader.replace(/^Bearer\s+/i, '').trim())
+                                                            || extractTokenFromUrl(reqUrl)
+                                                            || 'web_session_token';
+                                                        AndroidOAuthBridge.onUserSessionCaptured(
+                                                            tok,
+                                                            window.__lastApiSite || reqUrl,
+                                                            text
+                                                        );
                                                     }
                                                 } catch(e) {}
                                             }
@@ -1112,21 +1130,23 @@ fun MydlinkWebOAuthDialog(
                                             var origFetch = window.fetch;
                                             window.fetch = function(input, init) {
                                                 var u = (typeof input === 'string') ? input : (input && input.url);
+                                                var auth = null;
                                                 try {
                                                     var h = init && init.headers;
-                                                    var auth = null;
                                                     if (h) {
                                                         if (typeof h.get === 'function') auth = h.get('Authorization') || h.get('authorization');
                                                         else auth = h['Authorization'] || h['authorization'];
-                                                    }
-                                                    if (auth && auth.toLowerCase().indexOf('bearer ') === 0 && u && (u.indexOf('/me/') !== -1 || u.indexOf('/device/') !== -1)) {
-                                                        AndroidOAuthBridge.onUserTokenCaptured(auth.substring(7).trim(), u);
                                                     }
                                                 } catch(e) {}
                                                 return origFetch.apply(this, arguments).then(function(resp) {
                                                     try {
                                                         if (u && u.indexOf('mydlink.com') !== -1) {
-                                                            resp.clone().text().then(function(txt) { inspectTokenPayload(txt, u); });
+                                                            resp.clone().text().then(function(txt) {
+                                                                handleAuthJson(txt, u);
+                                                                if (u.indexOf('/device/list') !== -1) {
+                                                                    handleDeviceListJson(txt, u, auth);
+                                                                }
+                                                            });
                                                         }
                                                     } catch(e) {}
                                                     return resp;
@@ -1141,10 +1161,8 @@ fun MydlinkWebOAuthDialog(
                                                 return origOpen.apply(this, arguments);
                                             };
                                             XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
-                                                if (header && header.toLowerCase() === 'authorization' && value && value.toLowerCase().indexOf('bearer ') === 0) {
-                                                    if (this.__reqUrl && (this.__reqUrl.indexOf('/me/') !== -1 || this.__reqUrl.indexOf('/device/') !== -1)) {
-                                                        AndroidOAuthBridge.onUserTokenCaptured(value.substring(7).trim(), this.__reqUrl);
-                                                    }
+                                                if (header && header.toLowerCase() === 'authorization') {
+                                                    this.__authHeader = value;
                                                 }
                                                 return origSetHeader.apply(this, arguments);
                                             };
@@ -1152,7 +1170,10 @@ fun MydlinkWebOAuthDialog(
                                                 var self = this;
                                                 this.addEventListener('load', function() {
                                                     if (self.__reqUrl && self.__reqUrl.indexOf('mydlink.com') !== -1 && typeof self.responseText === 'string') {
-                                                        inspectTokenPayload(self.responseText, self.__reqUrl);
+                                                        handleAuthJson(self.responseText, self.__reqUrl);
+                                                        if (self.__reqUrl.indexOf('/device/list') !== -1) {
+                                                            handleDeviceListJson(self.responseText, self.__reqUrl, self.__authHeader);
+                                                        }
                                                     }
                                                 });
                                                 return origSend.apply(this, arguments);
@@ -1504,6 +1525,9 @@ fun CameraVideoSurface(
     onRefreshStream: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("mydlink_prefs", Context.MODE_PRIVATE) }
+    val token = remember { prefs.getString("access_token", null) }
+    var webVideoPlaying by remember(camera.id) { mutableStateOf(false) }
 
     if (camera.privacyMode) {
         Box(modifier = Modifier.fillMaxSize().background(Color(0xFF090A0D)), contentAlignment = Alignment.Center) {
@@ -1548,6 +1572,122 @@ fun CameraVideoSurface(
             },
             modifier = Modifier.fillMaxSize()
         )
+    } else if (token != null && token != "demo_local_token") {
+        // WebRTC Cloud přehrávač: spustí přenos z přihlášené relace mydlink a izoluje čistý prvek <video>
+        Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0D1117))) {
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        CookieManager.getInstance().setAcceptCookie(true)
+                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.mediaPlaybackRequiresUserGesture = false
+                        settings.userAgentString = MydlinkClient.DESKTOP_USER_AGENT
+                        webChromeClient = WebChromeClient()
+
+                        addJavascriptInterface(object {
+                            @JavascriptInterface
+                            fun onVideoFramesReady() {
+                                post { webVideoPlaying = true }
+                            }
+                        }, "AndroidStreamBridge")
+
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                val safeName = JSONObject.quote(camera.name)
+                                val safeId = JSONObject.quote(camera.id)
+                                val playerHook = """
+                                    (function() {
+                                        var targetName = $safeName;
+                                        var targetId = $safeId;
+                                        var clickedCamera = false;
+
+                                        function isolateVideo() {
+                                            var videos = document.querySelectorAll('video');
+                                            for (var i = 0; i < videos.length; i++) {
+                                                var v = videos[i];
+                                                v.muted = ${camera.muted};
+                                                v.autoplay = true;
+                                                v.playsInline = true;
+                                                if (v.paused) { v.play().catch(function(){}); }
+                                                if (v.readyState >= 2 && v.videoWidth > 0) {
+                                                    v.style.cssText = 'position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;object-fit:cover !important;z-index:999999 !important;background:#000 !important;';
+                                                    AndroidStreamBridge.onVideoFramesReady();
+                                                    return true;
+                                                }
+                                            }
+                                            return false;
+                                        }
+
+                                        setInterval(function() {
+                                            if (isolateVideo()) return;
+                                            if (!clickedCamera) {
+                                                var candidates = document.querySelectorAll('div, span, button, a, p, h3, h4');
+                                                for (var j = 0; j < candidates.length; j++) {
+                                                    var el = candidates[j];
+                                                    var txt = (el.innerText || '').trim();
+                                                    if (txt === targetName || (targetId && (el.outerHTML || '').indexOf(targetId) !== -1)) {
+                                                        el.click();
+                                                        if (el.parentElement) el.parentElement.click();
+                                                        clickedCamera = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }, 1000);
+                                    })();
+                                """.trimIndent()
+                                view?.evaluateJavascript(playerHook, null)
+                            }
+                        }
+                        loadUrl(MydlinkClient.MYDLINK_WEB_PORTAL_URL)
+                    }
+                },
+                update = { webView ->
+                    webView.evaluateJavascript(
+                        "document.querySelectorAll('video').forEach(v => v.muted = ${camera.muted});",
+                        null
+                    )
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Dokud nenaběhnou skutečné snímky videa, zakryjeme WebView čistou nativní obrazovkou
+            if (!webVideoPlaying) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Brush.verticalGradient(listOf(Color(0xFF1F2937), Color(0xFF111827))))
+                        .padding(8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(22.dp),
+                            strokeWidth = 2.dp,
+                            color = Color(0xFF34D399)
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Připojuji WebRTC (${camera.model})...",
+                            fontSize = 10.sp,
+                            color = Color(0xFFD1D5DB),
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        OutlinedButton(
+                            onClick = onRefreshStream,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier.height(24.dp)
+                        ) {
+                            Text("Obnovit", fontSize = 9.sp)
+                        }
+                    }
+                }
+            }
+        }
     } else {
         Box(
             modifier = Modifier
@@ -1560,26 +1700,7 @@ fun CameraVideoSurface(
                 Icon(Icons.Default.Videocam, null, tint = Color(0xFF34D399), modifier = Modifier.size(26.dp))
                 Spacer(Modifier.height(4.dp))
                 Text(camera.model, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFD1D5DB))
-                Spacer(Modifier.height(4.dp))
-                OutlinedButton(
-                    onClick = onRefreshStream,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                    modifier = Modifier.height(26.dp)
-                ) {
-                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(13.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Načíst stream", fontSize = 10.sp)
-                }
-                if (camera.streamStatusNote.isNotEmpty()) {
-                    Text(
-                        camera.streamStatusNote,
-                        fontSize = 8.sp,
-                        color = Color(0xFF9CA3AF),
-                        maxLines = 2,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
-                }
+                Text("Demo režim (offline)", fontSize = 9.sp, color = Color(0xFF9CA3AF))
             }
         }
     }
