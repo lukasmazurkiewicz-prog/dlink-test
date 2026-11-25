@@ -565,14 +565,16 @@ fun MojeKameryApp() {
 
     LaunchedEffect(accessToken) {
         val token = accessToken
-        if (token != null && token != "demo_local_token") {
+        if (token != null && token != "demo_local_token" && token != "web_session_token") {
             isRefreshingStreams = true
             val res = MydlinkClient.loadCamerasWithToken(token, apiSite)
-            cameras = res.cameras
-            diagnosticLog = res.diagnosticLog
-            if (res.cameras.isNotEmpty()) {
-                selectedSingleId = res.cameras.first().id
+            if (!res.usedFallback) {
+                cameras = res.cameras
+                if (res.cameras.isNotEmpty()) {
+                    selectedSingleId = res.cameras.first().id
+                }
             }
+            diagnosticLog = res.diagnosticLog
             isRefreshingStreams = false
         }
     }
@@ -1076,11 +1078,11 @@ fun MydlinkWebOAuthDialog(
                                     devicesJson: String?
                                 ) {
                                     if (!token.isNullOrBlank() &&
-                                        token.length > 20 &&
+                                        token.length >= 10 &&
                                         alreadyCaptured.compareAndSet(false, true)
                                     ) {
                                         post {
-                                            statusHint = "Účet ověřen! Načítám vaše kamery..."
+                                            statusHint = "Účet ověřen! Přepínám na kamery..."
                                             onTokenCaptured(token, siteOrUrl, devicesJson)
                                         }
                                     }
@@ -1097,16 +1099,71 @@ fun MydlinkWebOAuthDialog(
                                             window.__lastUserToken = null;
                                             window.__lastApiSite = null;
 
-                                            function extractTokenFromUrl(u) {
-                                                if (!u) return null;
-                                                var m = u.match(/[?&]access_token=([^&]+)/);
-                                                return m ? decodeURIComponent(m[1]) : null;
+                                            function findStoredToken() {
+                                                try {
+                                                    var stores = [window.localStorage, window.sessionStorage];
+                                                    for (var s = 0; s < stores.length; s++) {
+                                                        var st = stores[s];
+                                                        if (!st) continue;
+                                                        for (var i = 0; i < st.length; i++) {
+                                                            var k = st.key(i) || '';
+                                                            var v = st.getItem(k) || '';
+                                                            if (k.toLowerCase().indexOf('token') !== -1 && v.length > 20) {
+                                                                try {
+                                                                    var parsed = JSON.parse(v);
+                                                                    if (parsed && parsed.access_token) return parsed.access_token;
+                                                                } catch(e) {
+                                                                    if (v.indexOf('{') === -1) return v.replace(/"/g, '');
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } catch(e) {}
+                                                return null;
+                                            }
+
+                                            function scrapeCamerasFromDom() {
+                                                var bodyTxt = document.body ? (document.body.innerText || '') : '';
+                                                if (bodyTxt.indexOf('Watch Live') === -1 && bodyTxt.indexOf('Click to watch live') === -1) {
+                                                    return null;
+                                                }
+                                                var found = [];
+                                                var seenNames = {};
+                                                var allEls = document.querySelectorAll('div, section, article, li');
+                                                for (var i = 0; i < allEls.length; i++) {
+                                                    var el = allEls[i];
+                                                    var txt = (el.innerText || '').trim();
+                                                    if (txt.indexOf('Watch Live') !== -1 && txt.length < 300) {
+                                                        var lines = txt.split('\n').map(function(l) { return l.trim(); }).filter(function(l) {
+                                                            return l.length > 1 &&
+                                                                l.indexOf('Watch Live') === -1 &&
+                                                                l.indexOf('Click to watch') === -1 &&
+                                                                l.indexOf('Cameras') === -1 &&
+                                                                l.indexOf('My Home') === -1 &&
+                                                                !/^\d{4}\/\d{2}\/\d{2}/.test(l);
+                                                        });
+                                                        if (lines.length > 0) {
+                                                            var camName = lines[0];
+                                                            var modelMatch = txt.match(/DCS-[A-Z0-9-]+/i);
+                                                            var model = modelMatch ? modelMatch[0].toUpperCase() : 'DCS-6500LH';
+                                                            if (!seenNames[camName]) {
+                                                                seenNames[camName] = true;
+                                                                found.push({
+                                                                    mydlink_id: 'portal_cam_' + found.length,
+                                                                    device_name: camName,
+                                                                    model: model,
+                                                                    online: true
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                return found.length > 0 ? JSON.stringify({ data: found }) : null;
                                             }
 
                                             function handleAuthJson(text, reqUrl) {
                                                 try {
                                                     var data = JSON.parse(text);
-                                                    // Ignorujeme anonymní client_credentials token (nemá refresh_token)
                                                     if (data && data.access_token && data.refresh_token) {
                                                         window.__lastUserToken = data.access_token;
                                                         window.__lastApiSite = data.api_site || reqUrl;
@@ -1121,7 +1178,7 @@ fun MydlinkWebOAuthDialog(
                                                     if (Array.isArray(list) && list.length > 0) {
                                                         var tok = window.__lastUserToken
                                                             || (authHeader && authHeader.replace(/^Bearer\s+/i, '').trim())
-                                                            || extractTokenFromUrl(reqUrl)
+                                                            || findStoredToken()
                                                             || 'web_session_token';
                                                         AndroidOAuthBridge.onUserSessionCaptured(
                                                             tok,
@@ -1158,31 +1215,18 @@ fun MydlinkWebOAuthDialog(
                                                 });
                                             };
 
-                                            var origOpen = XMLHttpRequest.prototype.open;
-                                            var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-                                            var origSend = XMLHttpRequest.prototype.send;
-                                            XMLHttpRequest.prototype.open = function(method, url) {
-                                                this.__reqUrl = url;
-                                                return origOpen.apply(this, arguments);
-                                            };
-                                            XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
-                                                if (header && header.toLowerCase() === 'authorization') {
-                                                    this.__authHeader = value;
+                                            // Kontrola DOM po přihlášení (okamžité zachycení kamer z portálu)
+                                            setInterval(function() {
+                                                var scraped = scrapeCamerasFromDom();
+                                                if (scraped) {
+                                                    var tok = window.__lastUserToken || findStoredToken() || 'web_session_token';
+                                                    AndroidOAuthBridge.onUserSessionCaptured(
+                                                        tok,
+                                                        window.__lastApiSite || 'https://mp-eu-openapi.auto.mydlink.com',
+                                                        scraped
+                                                    );
                                                 }
-                                                return origSetHeader.apply(this, arguments);
-                                            };
-                                            XMLHttpRequest.prototype.send = function() {
-                                                var self = this;
-                                                this.addEventListener('load', function() {
-                                                    if (self.__reqUrl && self.__reqUrl.indexOf('mydlink.com') !== -1 && typeof self.responseText === 'string') {
-                                                        handleAuthJson(self.responseText, self.__reqUrl);
-                                                        if (self.__reqUrl.indexOf('/device/list') !== -1) {
-                                                            handleDeviceListJson(self.responseText, self.__reqUrl, self.__authHeader);
-                                                        }
-                                                    }
-                                                });
-                                                return origSend.apply(this, arguments);
-                                            };
+                                            }, 1000);
                                         })();
                                     """.trimIndent()
                                     view?.evaluateJavascript(hookScript, null)
@@ -1606,7 +1650,7 @@ fun CameraVideoSurface(
                                     (function() {
                                         var targetName = $safeName;
                                         var targetId = $safeId;
-                                        var clickedCamera = false;
+                                        var clickedWatchLive = false;
 
                                         function isolateVideo() {
                                             var videos = document.querySelectorAll('video');
@@ -1627,15 +1671,25 @@ fun CameraVideoSurface(
 
                                         setInterval(function() {
                                             if (isolateVideo()) return;
-                                            if (!clickedCamera) {
-                                                var candidates = document.querySelectorAll('div, span, button, a, p, h3, h4');
-                                                for (var j = 0; j < candidates.length; j++) {
-                                                    var el = candidates[j];
-                                                    var txt = (el.innerText || '').trim();
-                                                    if (txt === targetName || (targetId && (el.outerHTML || '').indexOf(targetId) !== -1)) {
-                                                        el.click();
-                                                        if (el.parentElement) el.parentElement.click();
-                                                        clickedCamera = true;
+                                            if (!clickedWatchLive) {
+                                                var blocks = document.querySelectorAll('div, section, article');
+                                                for (var j = 0; j < blocks.length; j++) {
+                                                    var box = blocks[j];
+                                                    var txt = (box.innerText || '');
+                                                    if (txt.indexOf(targetName) !== -1 && txt.indexOf('Watch Live') !== -1 && txt.length < 350) {
+                                                        var btns = box.querySelectorAll('button, span, div, a');
+                                                        for (var k = 0; k < btns.length; k++) {
+                                                            var bTxt = (btns[k].innerText || '').trim();
+                                                            if (bTxt.indexOf('Watch Live') !== -1 || bTxt.indexOf('Click to watch') !== -1) {
+                                                                btns[k].click();
+                                                                clickedWatchLive = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if (!clickedWatchLive) {
+                                                            box.click();
+                                                            clickedWatchLive = true;
+                                                        }
                                                         break;
                                                     }
                                                 }
